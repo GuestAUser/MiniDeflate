@@ -173,3 +173,4 @@ Tested on representative data:
 Copyright (c) 2025 [GuestAUser](https://github.com/GuestAUser). All rights reserved.
 
 Proprietary software. Unauthorized copying, modification, distribution, or use is strictly prohibited without prior written permission from the copyright holder.
+
