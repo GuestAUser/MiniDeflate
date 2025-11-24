@@ -1,99 +1,77 @@
-# MiniDeflate
+# DEFLATE Compressor
 
-A high-performance, single-file implementation of a DEFLATE-style hybrid compression engine in standard C99.
-
-This project implements the core logic behind modern archivers (like `gzip` and `zlib`) from first principles, combining **LZSS** (Lempel-Ziv-Storer-Szymanski) for dictionary compression and **Canonical Huffman Coding** for entropy encoding.
+A secure, high-performance file compression utility in pure C99.
 
 ## Features
 
-  * **Hybrid Architecture:** Chains LZSS tokenization with Block-Based Canonical Huffman coding.
-  * **Zero Dependencies:** Written in pure C99 standard library (`<stdio.h>`, `<stdlib.h>`).
-  * **Data Integrity:** Implements full **CRC32** checksum verification on decompression.
-  * **Systems Ready:** Uses heap allocation for large structures to prevent stack overflows; completely encapsulated state.
-  * **High Efficiency:** Achieves \~60-70% compression ratios on text and source code (comparable to early `zip` versions).
+- **Hash Chain LZSS** - O(1) pattern lookup with 4KB sliding window
+- **Fast Huffman Decoding** - 12-bit lookup table for O(1) symbol decoding
+- **CRC32 Verification** - IEEE 802.3 polynomial integrity checking
+- **Security Hardened** - Path traversal protection, size limits, zip bomb prevention
 
-## Compilation
-
-The project is contained entirely within `deflate.c`. For maximum performance (vectorization of the sliding window search), compile with `-O3`.
+## Build
 
 ```bash
-# GCC / MinGW
-gcc -O3 deflate.c -o deflate
-
-# Clang
-clang -O3 deflate.c -o deflate
-
-# MSVC
-cl /O2 deflate.c
+gcc -O3 -march=native -Wall -Wextra -std=c99 deflate.c -o deflate
 ```
 
 ## Usage
 
-### Compression
-
-Compresses a source file into a proprietary `.bin` format.
-
 ```bash
-./deflate -c <input_file> <output_file>
+# Compress
+./deflate -c input.txt output.bin
+
+# Decompress
+./deflate -d output.bin restored.txt
 ```
 
-*Example:*
+## Output Example
 
-```bash
-./deflate -c source_code.c payload.bin
-# Output: Compression Complete. CRC32: 0xA1B2C3D4
+```
+Compression Complete
+Input:  1048576 bytes
+Output: 345678 bytes
+Ratio:  32.96%
+CRC32:  0xABCD1234
 ```
 
-### Decompression
+## Limits
 
-Restores the original file and verifies bit-perfect integrity using CRC32.
+| Parameter | Value |
+|-----------|-------|
+| Max Input | 1 GB |
+| Max Output | 10 GB |
+| Window Size | 4 KB |
+| Block Size | 32 KB |
 
-```bash
-./deflate -d <input_file> <output_file>
+## Error Codes
+
+| Code | Description |
+|------|-------------|
+| 0 | Success |
+| -1 | I/O error |
+| -2 | Memory allocation failed |
+| -3 | Invalid format |
+| -4 | Data corrupted |
+| -5 | Size limit exceeded |
+| -6 | Unsafe path |
+
+## Algorithm
+
+1. **LZSS Stage**: Finds repeated patterns using hash chains, emits literals or (distance, length) pairs
+2. **Huffman Stage**: Builds optimal prefix codes per 32KB block, encodes tokens
+3. **Verification**: CRC32 computed during compression, verified on decompression
+
+## File Format
+
 ```
+[Magic: 4B] [Blocks...] [CRC32: 4B]
 
-*Example:*
-
-```bash
-./deflate -d payload.bin restored.c
-# Output: Integrity Verified: OK.
+Block = [LastFlag: 1b] [MaxSym: 16b] [Depths...] [Huffman Data] [EOB]
 ```
-
-## Technical Architecture
-
-The engine operates in a streaming pipeline:
-
-1.  **LZSS Tokenizer:**
-
-      * Uses a **4KB Sliding Window** (Circular Buffer).
-      * Maintains a **Binary Search Tree** (BST) to find longest string matches in $O(\log n)$.
-      * Emits a stream of **Tokens**: either *Literals* (0-255) or *Matches* (Length 3-258, Distance 1-4096).
-
-2.  **Frequency Analysis (Block Based):**
-
-      * Processes data in **32KB Blocks**.
-      * Constructs a dynamic frequency table for the block's tokens.
-
-3.  **Canonical Huffman Encoder:**
-
-      * Builds a Min-Heap to generate an optimal prefix tree.
-      * Calculates bit-lengths for every symbol.
-      * Generates **Canonical Codes** (numerical sequence based on bit-length) to minimize header overhead.
-
-4.  **Bitstream I/O:**
-
-      * Packs variable-length codes into a buffered 16KB stream.
-      * Appends a 32-bit CRC checksum at the file footer.
-
-## File Format Specification
-
-| Offset | Size | Description |
-| :--- | :--- | :--- |
-| 0x00 | 4 Bytes | **Magic Signature** (`0x50524F5A` / "PROZ") |
-| 0x04 | Var | **Data Blocks** (Header + Bitstream) |
-| EOF-4 | 4 Bytes | **CRC32 Checksum** (Little Endian) |
 
 ## License
 
+Copyright (c) 2025 [GuestAUser](https://github.com/GuestAUser). All rights reserved.
 
-This software is provided "as is", without warranty of any kind. Free to use for educational and commercial purposes, but a shout-out or reference to me (GuestAUser) as the original creator is much appreciated!
+This software is proprietary. Unauthorized copying, modification, distribution, or use is strictly prohibited without prior written permission from the copyright holder.
