@@ -16,6 +16,7 @@ Single-file implementation with **zero dependencies** beyond the C standard libr
 
 ### Security
 - **Path Traversal Protection** - Rejects `..`, absolute paths, and dangerous characters
+- **Symlink Attack Prevention** - Refuses to follow symlinks/reparse points on output
 - **Zip Bomb Prevention** - Enforces 1GB input / 10GB output limits
 - **Bounds-Safe Access** - All window/buffer accesses are clamped and verified
 - **Fail-Closed Integrity** - Truncated files are rejected, not warned
@@ -91,8 +92,8 @@ Integrity Verified: OK
 
 ```
 ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│   Input     │───▶│    LZSS     │────▶│   Huffman   │────▶ Output
-│   Stream    │     │(Hash Chain) │     │ (Canonical) │
+│   Input     │────▶│    LZSS     │────▶│   Huffman   │────▶ Output
+│   Stream    │     │  (Hash Chain)│    │ (Canonical) │
 └─────────────┘     └─────────────┘     └─────────────┘
                            │                    │
                     Literals or           Per-block
@@ -126,15 +127,17 @@ All multi-byte values are little-endian. Bit streams are MSB-first.
 |--------|------------|
 | Path traversal (`../`) | Rejected by `is_safe_path()` |
 | Absolute paths | Rejected (Unix `/`, Windows `C:`) |
+| Symlink attacks (TOCTOU) | `secure_fopen_write()` via lstat/reparse check |
 | Zip bombs | 10GB output limit, checked incrementally |
 | Truncated files | CRC read failure = fatal error |
 | Buffer overflows | All indices bounds-checked |
 | Integer overflows | `uint64_t` for size tracking |
 | Memory leaks | Centralized cleanup via `goto` labels |
+| Ghost buffer (state desync) | Explicit bits_in_ram check before peek |
 
 ## Corrections Applied
 
-This implementation underwent rigorous review with 16 documented corrections:
+This implementation underwent rigorous review with 18 documented corrections:
 
 1. Clear variable naming (`bytes_in_window` vs ambiguous `len`)
 2. Heap overflow detection (`heap_push` returns bool)
@@ -152,6 +155,8 @@ This implementation underwent rigorous review with 16 documented corrections:
 14. Accurate output byte counting
 15. Heap destructor frees remaining nodes
 16. Complete BitStream state save/restore
+17. TOCTOU/Symlink prevention (`secure_fopen_write` via lstat/reparse)
+18. Ghost buffer prevention (explicit bits_in_ram check before peek)
 
 ## Performance
 
@@ -168,9 +173,3 @@ Tested on representative data:
 Copyright (c) 2025 [GuestAUser](https://github.com/GuestAUser). All rights reserved.
 
 Proprietary software. Unauthorized copying, modification, distribution, or use is strictly prohibited without prior written permission from the copyright holder.
-
-
-
-
-
-

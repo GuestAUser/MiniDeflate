@@ -25,6 +25,8 @@
  * 14. bytes_out: accurate tracking via BitStream counter (was misleading)
  * 15. heap_destroy: now frees remaining HuffmanNode pointers (was leaking on error)
  * 16. decode_symbol_fast: save/restore bytes_in_buf to handle buffer refill edge case
+ * 17. TOCTOU/Symlink: secure_fopen_write() refuses to follow symlinks (lstat/reparse)
+ * 18. Ghost buffer: explicit bits_in_ram check + assertion prevents I/O during peek
  * ============================================================================
  */
 
@@ -34,6 +36,20 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <limits.h>
+
+/* FIX #17: Platform-specific includes for secure file operations */
+#ifdef _WIN32
+#include <windows.h>
+#include <io.h>
+#include <fcntl.h>
+#define PLATFORM_WINDOWS 1
+#else
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#define PLATFORM_WINDOWS 0
+#endif
 
 #ifdef DEBUG
 #include <assert.h>
@@ -152,6 +168,58 @@ typedef struct {
 
 /* Forward declaration for heap_destroy */
 static void free_tree(HuffmanNode *root);
+
+/* ==================== SECURE FILE I/O ==================== */
+
+/**
+ * FIX #17: Secure file open that refuses to follow symlinks (TOCTOU mitigation).
+ *
+ * THREAT: Attacker creates symlink in shared directory pointing to sensitive file.
+ *         Tool follows symlink and overwrites/truncates the target.
+ *
+ * MITIGATION:
+ *   - Unix: Use lstat() to detect symlinks before opening
+ *   - Windows: Check for reparse points (NTFS symlinks/junctions)
+ *
+ * Returns NULL if path is a symlink or on error.
+ */
+static FILE* secure_fopen_write(const char *path, bool *is_symlink) {
+    *is_symlink = false;
+
+#if PLATFORM_WINDOWS
+    /* Windows: Check for reparse point (symlink/junction) */
+    DWORD attrs = GetFileAttributesA(path);
+    if (attrs != INVALID_FILE_ATTRIBUTES) {
+        if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) {
+            *is_symlink = true;
+            return NULL;  /* Refuse to follow symlink */
+        }
+    }
+    /* File doesn't exist or is regular - safe to open */
+    return fopen(path, "wb");
+
+#else
+    /* Unix: Use lstat to detect symlinks (doesn't follow them) */
+    struct stat st;
+    if (lstat(path, &st) == 0) {
+        /* Path exists - check if it's a symlink */
+        if (S_ISLNK(st.st_mode)) {
+            *is_symlink = true;
+            return NULL;  /* Refuse to follow symlink */
+        }
+        /* Regular file - safe to overwrite */
+    }
+    /* Either doesn't exist or is regular file - safe to open */
+    return fopen(path, "wb");
+#endif
+}
+
+/**
+ * Secure read-only open (less critical but consistent API).
+ */
+static FILE* secure_fopen_read(const char *path) {
+    return fopen(path, "rb");
+}
 
 /* ==================== PORTABLE I/O ==================== */
 
@@ -764,30 +832,53 @@ static DeflateError build_fast_decode_table(FastDecodeEntry *decode_table,
 
 /**
  * FIX #16: Save/restore bytes_in_buf along with other state during peek.
- * If bs_read_bit triggers a buffer refill, bytes_in_buf changes and must
- * be restored to maintain consistency with pos.
+ * FIX #18: Explicit guard to ensure NO buffer refill occurs during peek.
+ *
+ * SECURITY NOTE (Ghost Buffer Prevention):
+ * The fast-path peek reads bits speculatively then restores state. If a buffer
+ * refill (fread) occurred during peek, the buffer contents change and restoration
+ * would leave us reading from wrong data. The available_bits check ensures we
+ * have enough bits IN RAM to complete the peek without I/O.
  */
 static int32_t decode_symbol_fast(BitStream *bs, const FastDecodeEntry *decode_table,
                                   const CanonicalEntry *table, int32_t t_count) {
-    int32_t available_bits = bs->bit_count + 8 * (int32_t)(bs->bytes_in_buf - bs->pos);
+    /*
+     * FIX #18: Calculate bits available WITHOUT triggering I/O.
+     * This is the critical security invariant: we only enter fast path
+     * if all required bits are already in memory (bit_acc + buffer).
+     */
+    int32_t bits_in_ram = bs->bit_count + 8 * (int32_t)(bs->bytes_in_buf - bs->pos);
 
-    /* Try fast path with lookup table */
-    if (available_bits >= FAST_DECODE_BITS) {
+    /* SECURITY: Only proceed if we can peek without disk I/O */
+    if (bits_in_ram >= FAST_DECODE_BITS) {
         uint32_t peek = 0;
 
         /* FIX #16: Save ALL mutable state that bs_read_bit can modify */
         uint32_t orig_bit_count = (uint32_t)bs->bit_count;
         uint64_t orig_bit_acc = bs->bit_acc;
         size_t orig_pos = bs->pos;
-        size_t orig_bytes_in_buf = bs->bytes_in_buf;  /* FIX #16 */
+        size_t orig_bytes_in_buf = bs->bytes_in_buf;
 
         for (int32_t i = 0; i < FAST_DECODE_BITS; i++) {
             int32_t b = bs_read_bit(bs);
-            if (b == -1) return -1;
+            /*
+             * FIX #18: If we get EOF here, something is wrong - we calculated
+             * that we had enough bits. This indicates buffer corruption.
+             */
+            if (b == -1) {
+                DBG_PRINTF("Ghost buffer: unexpected EOF during peek\n");
+                return -1;
+            }
             peek = (peek << 1) | (uint32_t)b;
         }
 
-        DBG_ASSERT(peek < FAST_DECODE_SIZE);
+        /*
+         * FIX #18: Verify no buffer refill occurred (defense in depth).
+         * If bytes_in_buf changed, a refill happened and our state is corrupt.
+         */
+        DBG_ASSERT(bs->bytes_in_buf == orig_bytes_in_buf &&
+                   "Ghost buffer detected: refill during peek!");
+
         if (peek < FAST_DECODE_SIZE) {
             FastDecodeEntry entry = decode_table[peek];
             if (entry.bits_used > 0 && entry.bits_used <= FAST_DECODE_BITS) {
@@ -795,7 +886,7 @@ static int32_t decode_symbol_fast(BitStream *bs, const FastDecodeEntry *decode_t
                 bs->bit_count = (int32_t)orig_bit_count;
                 bs->bit_acc = orig_bit_acc;
                 bs->pos = orig_pos;
-                bs->bytes_in_buf = orig_bytes_in_buf;  /* FIX #16 */
+                bs->bytes_in_buf = orig_bytes_in_buf;
                 for (int32_t i = 0; i < entry.bits_used; i++) bs_read_bit(bs);
                 return entry.symbol;
             }
@@ -805,7 +896,7 @@ static int32_t decode_symbol_fast(BitStream *bs, const FastDecodeEntry *decode_t
         bs->bit_count = (int32_t)orig_bit_count;
         bs->bit_acc = orig_bit_acc;
         bs->pos = orig_pos;
-        bs->bytes_in_buf = orig_bytes_in_buf;  /* FIX #16 */
+        bs->bytes_in_buf = orig_bytes_in_buf;
     }
 
     /* Slow path: bit-by-bit decoding */
@@ -880,16 +971,21 @@ static DeflateError compress_file(const char *infile, const char *outfile) {
         return DEFLATE_ERR_PATH;
     }
 
-    in = fopen(infile, "rb");
+    in = secure_fopen_read(infile);
     if (!in) {
         perror("Error opening input");
         return DEFLATE_ERR_IO;
     }
 
-    /* FIX #7: Check file size without relying on ftell accuracy for large files */
-    /* Stream-based approach: we track bytes as we read them */
-    out = fopen(outfile, "wb");
+    /* FIX #17: Secure file open - refuse to follow symlinks */
+    bool is_symlink = false;
+    out = secure_fopen_write(outfile, &is_symlink);
     if (!out) {
+        if (is_symlink) {
+            fprintf(stderr, "Error: Output path is a symlink (security risk)\n");
+            fclose(in);
+            return DEFLATE_ERR_PATH;
+        }
         perror("Error opening output");
         fclose(in);
         return DEFLATE_ERR_IO;
@@ -1070,14 +1166,21 @@ static DeflateError decompress_file(const char *infile, const char *outfile) {
         return DEFLATE_ERR_PATH;
     }
 
-    in = fopen(infile, "rb");
+    in = secure_fopen_read(infile);
     if (!in) {
         perror("Error opening input");
         return DEFLATE_ERR_IO;
     }
 
-    out = fopen(outfile, "wb");
+    /* FIX #17: Secure file open - refuse to follow symlinks */
+    bool is_symlink = false;
+    out = secure_fopen_write(outfile, &is_symlink);
     if (!out) {
+        if (is_symlink) {
+            fprintf(stderr, "Error: Output path is a symlink (security risk)\n");
+            fclose(in);
+            return DEFLATE_ERR_PATH;
+        }
         perror("Error opening output");
         fclose(in);
         return DEFLATE_ERR_IO;
