@@ -95,4 +95,5 @@ The engine operates in a streaming pipeline:
 
 ## License
 
-This software is provided "as is", without warranty of any kind. Free to use for educational and commercial purposes.
+
+This software is provided "as is", without warranty of any kind. Free to use for educational and commercial purposes, but a shout-out or reference to me (GuestAUser) as the original creator is much appreciated!
