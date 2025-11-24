@@ -23,6 +23,8 @@
  * 12. is_safe_path: use 'check' consistently; also reject ':' in path components
  * 13. bs_write: added mode_write assertion to catch misuse in debug builds
  * 14. bytes_out: accurate tracking via BitStream counter (was misleading)
+ * 15. heap_destroy: now frees remaining HuffmanNode pointers (was leaking on error)
+ * 16. decode_symbol_fast: save/restore bytes_in_buf to handle buffer refill edge case
  * ============================================================================
  */
 
@@ -147,6 +149,9 @@ typedef struct {
 /* ==================== MACROS ==================== */
 
 #define SAFE_FREE(ptr) do { if (ptr) { free(ptr); ptr = NULL; } } while(0)
+
+/* Forward declaration for heap_destroy */
+static void free_tree(HuffmanNode *root);
 
 /* ==================== PORTABLE I/O ==================== */
 
@@ -329,9 +334,14 @@ static uint32_t bs_read_bits(BitStream *bs, int32_t bits, bool *error) {
 
 /**
  * Read 32-bit value at byte boundary (little-endian).
+ *
+ * INVARIANT: Discards any pending partial byte by setting bit_count = 0.
+ * This is correct because the encoder pads to byte boundary in bs_flush
+ * before writing the CRC footer. Caller must ensure the stream is at a
+ * known byte-aligned position (e.g., after EOB symbol).
  */
 static bool bs_read_aligned_uint32(BitStream *bs, uint32_t *out) {
-    bs->bit_count = 0;  /* Discard partial byte */
+    bs->bit_count = 0;  /* Discard partial byte - see invariant above */
     uint32_t res = 0;
     for (int i = 0; i < 4; i++) {
         if (bs->pos >= bs->bytes_in_buf) {
@@ -461,11 +471,18 @@ static MinHeap* heap_create(int32_t cap) {
     return h;
 }
 
+/**
+ * FIX #15: Free any HuffmanNode pointers still in heap on error cleanup.
+ * Previously only freed the array, leaking nodes on early exit.
+ */
 static void heap_destroy(MinHeap *h) {
-    if (h) {
-        free(h->nodes);
-        free(h);
+    if (!h) return;
+    /* Free any nodes remaining in heap (e.g., after allocation failure) */
+    for (int32_t i = 0; i < h->size; i++) {
+        free_tree(h->nodes[i]);  /* Recursively frees subtrees if any */
     }
+    free(h->nodes);
+    free(h);
 }
 
 /**
@@ -745,6 +762,11 @@ static DeflateError build_fast_decode_table(FastDecodeEntry *decode_table,
     return DEFLATE_OK;
 }
 
+/**
+ * FIX #16: Save/restore bytes_in_buf along with other state during peek.
+ * If bs_read_bit triggers a buffer refill, bytes_in_buf changes and must
+ * be restored to maintain consistency with pos.
+ */
 static int32_t decode_symbol_fast(BitStream *bs, const FastDecodeEntry *decode_table,
                                   const CanonicalEntry *table, int32_t t_count) {
     int32_t available_bits = bs->bit_count + 8 * (int32_t)(bs->bytes_in_buf - bs->pos);
@@ -752,9 +774,12 @@ static int32_t decode_symbol_fast(BitStream *bs, const FastDecodeEntry *decode_t
     /* Try fast path with lookup table */
     if (available_bits >= FAST_DECODE_BITS) {
         uint32_t peek = 0;
+
+        /* FIX #16: Save ALL mutable state that bs_read_bit can modify */
         uint32_t orig_bit_count = (uint32_t)bs->bit_count;
         uint64_t orig_bit_acc = bs->bit_acc;
         size_t orig_pos = bs->pos;
+        size_t orig_bytes_in_buf = bs->bytes_in_buf;  /* FIX #16 */
 
         for (int32_t i = 0; i < FAST_DECODE_BITS; i++) {
             int32_t b = bs_read_bit(bs);
@@ -770,6 +795,7 @@ static int32_t decode_symbol_fast(BitStream *bs, const FastDecodeEntry *decode_t
                 bs->bit_count = (int32_t)orig_bit_count;
                 bs->bit_acc = orig_bit_acc;
                 bs->pos = orig_pos;
+                bs->bytes_in_buf = orig_bytes_in_buf;  /* FIX #16 */
                 for (int32_t i = 0; i < entry.bits_used; i++) bs_read_bit(bs);
                 return entry.symbol;
             }
@@ -779,6 +805,7 @@ static int32_t decode_symbol_fast(BitStream *bs, const FastDecodeEntry *decode_t
         bs->bit_count = (int32_t)orig_bit_count;
         bs->bit_acc = orig_bit_acc;
         bs->pos = orig_pos;
+        bs->bytes_in_buf = orig_bytes_in_buf;  /* FIX #16 */
     }
 
     /* Slow path: bit-by-bit decoding */
