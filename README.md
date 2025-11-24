@@ -4,6 +4,8 @@ A production-grade, security-hardened DEFLATE-style compressor in pure C99.
 
 Single-file implementation with **zero dependencies** beyond the C standard library.
 
+<img width="2800" height="2800" alt="image" src="https://github.com/user-attachments/assets/c21e00bc-17c3-4615-987a-a46f74fa80d5" />
+
 ## Features
 
 ### Compression
@@ -166,5 +168,6 @@ Tested on representative data:
 Copyright (c) 2025 [GuestAUser](https://github.com/GuestAUser). All rights reserved.
 
 Proprietary software. Unauthorized copying, modification, distribution, or use is strictly prohibited without prior written permission from the copyright holder.
+
 
 
