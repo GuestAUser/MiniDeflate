@@ -1,13 +1,14 @@
-# DEFLATE Compressor
+# MiniDeflate
 
-A secure, high-performance file compression utility in pure C99.
+A secure, portable DEFLATE-style compressor in pure C99.
 
 ## Features
 
-- **Hash Chain LZSS** - O(1) pattern lookup with 4KB sliding window
-- **Fast Huffman Decoding** - 12-bit lookup table for O(1) symbol decoding
-- **CRC32 Verification** - IEEE 802.3 polynomial integrity checking
-- **Security Hardened** - Path traversal protection, size limits, zip bomb prevention
+- **Hash Chain LZSS** - O(1) pattern lookup, 4KB sliding window, 128-entry chain limit
+- **Fast Huffman Decoding** - 12-bit lookup table for O(1) symbol resolution
+- **CRC32 Verification** - IEEE 802.3 polynomial with per-byte integrity
+- **Security Hardened** - Path traversal protection, zip bomb prevention, bounds-safe access
+- **Portable** - Little-endian serialization, cross-architecture compatible
 
 ## Build
 
@@ -18,14 +19,11 @@ gcc -O3 -march=native -Wall -Wextra -std=c99 deflate.c -o deflate
 ## Usage
 
 ```bash
-# Compress
-./deflate -c input.txt output.bin
-
-# Decompress
-./deflate -d output.bin restored.txt
+./deflate -c input.txt output.bin    # Compress
+./deflate -d output.bin restored.txt # Decompress
 ```
 
-## Output Example
+## Output
 
 ```
 Compression Complete
@@ -41,8 +39,10 @@ CRC32:  0xABCD1234
 |-----------|-------|
 | Max Input | 1 GB |
 | Max Output | 10 GB |
-| Window Size | 4 KB |
-| Block Size | 32 KB |
+| Window | 4 KB |
+| Block | 32 KB |
+| Hash Table | 32K entries |
+| Chain Depth | 128 |
 
 ## Error Codes
 
@@ -58,20 +58,20 @@ CRC32:  0xABCD1234
 
 ## Algorithm
 
-1. **LZSS Stage**: Finds repeated patterns using hash chains, emits literals or (distance, length) pairs
-2. **Huffman Stage**: Builds optimal prefix codes per 32KB block, encodes tokens
-3. **Verification**: CRC32 computed during compression, verified on decompression
+1. **LZSS** - Hash chain matching emits literals or (length, distance) pairs
+2. **Huffman** - Canonical codes built per 32KB block, depths stored in 4-bit nibbles
+3. **CRC32** - Computed on compression, verified on decompression
 
 ## File Format
 
 ```
-[Magic: 4B] [Blocks...] [CRC32: 4B]
+[Magic: 4B LE] [Blocks...] [CRC32: 4B LE]
 
-Block = [LastFlag: 1b] [MaxSym: 16b] [Depths...] [Huffman Data] [EOB]
+Block = [LastFlag: 1b] [MaxSym: 16b] [Depths: 4b each] [Huffman Data] [EOB]
 ```
 
 ## License
 
 Copyright (c) 2025 [GuestAUser](https://github.com/GuestAUser). All rights reserved.
 
-This software is proprietary. Unauthorized copying, modification, distribution, or use is strictly prohibited without prior written permission from the copyright holder.
+Proprietary software. Unauthorized use prohibited.

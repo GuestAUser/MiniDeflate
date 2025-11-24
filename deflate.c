@@ -121,6 +121,20 @@ typedef struct {
 
 #define SAFE_FREE(ptr) do { if (ptr) { free(ptr); ptr = NULL; } } while(0)
 
+/* ==================== PORTABLE I/O ==================== */
+
+static bool write_le32(FILE *fp, uint32_t val) {
+    uint8_t buf[4] = { val & 0xFF, (val >> 8) & 0xFF, (val >> 16) & 0xFF, (val >> 24) & 0xFF };
+    return fwrite(buf, 1, 4, fp) == 4;
+}
+
+static bool read_le32(FILE *fp, uint32_t *val) {
+    uint8_t buf[4];
+    if (fread(buf, 1, 4, fp) != 4) return false;
+    *val = buf[0] | ((uint32_t)buf[1] << 8) | ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 24);
+    return true;
+}
+
 /* ==================== CRC32 ==================== */
 
 static void init_crc32_table(uint32_t *table) {
@@ -218,12 +232,13 @@ static int32_t bs_read_bit(BitStream *bs) {
     return bit;
 }
 
-static uint32_t bs_read_bits(BitStream *bs, int32_t bits) {
-    if (bits < 0 || bits > 32) return 0;
+static uint32_t bs_read_bits(BitStream *bs, int32_t bits, bool *error) {
+    if (error) *error = false;
+    if (bits < 0 || bits > 32) { if (error) *error = true; return 0; }
     uint32_t val = 0;
     for (int32_t i = 0; i < bits; i++) {
         int32_t b = bs_read_bit(bs);
-        if (b == -1) return 0;
+        if (b == -1) { if (error) *error = true; return 0; }
         val = (val << 1) | b;
     }
     return val;
@@ -264,7 +279,7 @@ static void find_best_match(const DeflateContext *ctx, uint16_t pos, int32_t ava
                            int32_t *match_pos, int32_t *match_len) {
     *match_len = 0;
     *match_pos = 0;
-    if (available < MIN_MATCH) return;
+    if (available < MIN_MATCH || pos >= WINDOW_SIZE) return;
 
     uint32_t hash = hash4(&ctx->window[pos]);
     if (hash >= HASH_SIZE) return;
@@ -272,6 +287,11 @@ static void find_best_match(const DeflateContext *ctx, uint16_t pos, int32_t ava
     uint16_t chain = ctx->hash_chain.head[hash];
     int32_t chain_count = 0;
     int32_t max_len = (available < MAX_MATCH) ? available : MAX_MATCH;
+
+    /* Ensure bounds safety for doubled window buffer */
+    if (pos + max_len > WINDOW_SIZE * 2) max_len = WINDOW_SIZE * 2 - pos;
+    if (max_len < MIN_MATCH) return;
+
     uint8_t first = ctx->window[pos];
     uint8_t second = ctx->window[pos + 1];
 
@@ -284,10 +304,15 @@ static void find_best_match(const DeflateContext *ctx, uint16_t pos, int32_t ava
             continue;
         }
 
+        /* Bounds safety for chain access */
+        int32_t chain_max = (chain + max_len > WINDOW_SIZE * 2) ? (WINDOW_SIZE * 2 - chain) : max_len;
+        if (chain_max < MIN_MATCH) { chain = ctx->hash_chain.prev[chain]; continue; }
+
         if (ctx->window[chain + *match_len] == ctx->window[pos + *match_len] &&
             ctx->window[chain] == first && ctx->window[chain + 1] == second) {
             int32_t len = 2;
-            while (len < max_len && ctx->window[chain + len] == ctx->window[pos + len])
+            int32_t safe_max = (chain_max < max_len) ? chain_max : max_len;
+            while (len < safe_max && ctx->window[chain + len] == ctx->window[pos + len])
                 len++;
             if (len > *match_len) {
                 *match_len = len;
@@ -582,8 +607,7 @@ static DeflateError compress_file(const char *infile, const char *outfile) {
     FILE *out = fopen(outfile, "wb");
     if (!out) { perror("Error opening output"); fclose(in); return DEFLATE_ERR_IO; }
 
-    uint32_t magic = SIG_MAGIC;
-    if (fwrite(&magic, 4, 1, out) != 1) {
+    if (!write_le32(out, SIG_MAGIC)) {
         fclose(in); fclose(out);
         return DEFLATE_ERR_IO;
     }
@@ -678,7 +702,7 @@ static DeflateError compress_file(const char *infile, const char *outfile) {
         return err;
     }
 
-    if (fwrite(&crc, 4, 1, out) != 1) {
+    if (!write_le32(out, crc)) {
         SAFE_FREE(ctx->token_buf); free(ctx); fclose(in); fclose(out);
         return DEFLATE_ERR_IO;
     }
@@ -713,7 +737,7 @@ static DeflateError decompress_file(const char *infile, const char *outfile) {
     if (!out) { perror("Error opening output"); fclose(in); return DEFLATE_ERR_IO; }
 
     uint32_t magic;
-    if (fread(&magic, 4, 1, in) != 1 || magic != SIG_MAGIC) {
+    if (!read_le32(in, &magic) || magic != SIG_MAGIC) {
         fprintf(stderr, "Error: Invalid file format\n");
         fclose(in); fclose(out);
         return DEFLATE_ERR_FORMAT;
@@ -741,18 +765,19 @@ static DeflateError decompress_file(const char *infile, const char *outfile) {
     bool last_block = false;
 
     while (!last_block) {
+        bool read_err = false;
         last_block = bs_read_bit(&bs);
-        uint16_t max_sym = bs_read_bits(&bs, 16);
+        uint16_t max_sym = (uint16_t)bs_read_bits(&bs, 16, &read_err);
 
-        if (max_sym >= SYMBOL_COUNT) {
+        if (read_err || max_sym >= SYMBOL_COUNT) {
             fprintf(stderr, "Error: Invalid symbol count\n");
             goto decompress_error;
         }
 
         uint8_t depths[SYMBOL_COUNT] = {0};
         for (int32_t i = 0; i <= max_sym; i += 2) {
-            int32_t d1 = bs_read_bits(&bs, 4), d2 = bs_read_bits(&bs, 4);
-            if (d1 > MAX_HUFFMAN_DEPTH || d2 > MAX_HUFFMAN_DEPTH) {
+            int32_t d1 = bs_read_bits(&bs, 4, &read_err), d2 = bs_read_bits(&bs, 4, NULL);
+            if (read_err || d1 > MAX_HUFFMAN_DEPTH || d2 > MAX_HUFFMAN_DEPTH) {
                 fprintf(stderr, "Error: Invalid Huffman depth\n");
                 goto decompress_error;
             }
@@ -801,9 +826,10 @@ static DeflateError decompress_file(const char *infile, const char *outfile) {
                 r = (r + 1) & WINDOW_MASK;
             } else {
                 int32_t len = (sym - 257) + 3;
-                int32_t dist = bs_read_bits(&bs, 12);
+                bool dist_err = false;
+                int32_t dist = bs_read_bits(&bs, 12, &dist_err);
 
-                if (len < MIN_MATCH || len > MAX_MATCH || dist == 0 || dist > WINDOW_SIZE ||
+                if (dist_err || len < MIN_MATCH || len > MAX_MATCH || dist == 0 || dist > WINDOW_SIZE ||
                     (size_t)dist > total_output) {
                     fprintf(stderr, "Error: Invalid match\n");
                     goto decompress_error;
