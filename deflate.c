@@ -20,6 +20,9 @@
  * 9. DEBUG asserts: added compile-time diagnostics under #ifdef DEBUG
  * 10. Huffman cleanup: free_tree called on all error paths; no leaks
  * 11. CRC footer: fail-closed on truncated files; incomplete CRC is fatal error
+ * 12. is_safe_path: use 'check' consistently; also reject ':' in path components
+ * 13. bs_write: added mode_write assertion to catch misuse in debug builds
+ * 14. bytes_out: accurate tracking via BitStream counter (was misleading)
  * ============================================================================
  */
 
@@ -111,6 +114,8 @@ typedef struct {
  *
  * Write mode: bits accumulate in bit_acc from LSB, flushed MSB-first.
  * Read mode: bits consumed from MSB of each byte.
+ *
+ * FIX #14: Added bytes_written counter for accurate output size tracking.
  */
 typedef struct {
     FILE *fp;
@@ -120,6 +125,7 @@ typedef struct {
     uint64_t bit_acc;
     int32_t bit_count;
     bool mode_write;
+    uint64_t bytes_written;  /* FIX #14: Track actual bytes written */
 } BitStream;
 
 typedef struct {
@@ -200,6 +206,7 @@ static void bs_init(BitStream *bs, FILE *fp, bool write) {
     bs->bit_acc = 0;
     bs->bit_count = 0;
     bs->mode_write = write;
+    bs->bytes_written = 0;  /* FIX #14 */
     memset(bs->buffer, 0, IO_BUFFER_SIZE);
 }
 
@@ -229,6 +236,7 @@ static DeflateError bs_flush(BitStream *bs) {
         if (bs->pos >= IO_BUFFER_SIZE) {
             if (fwrite(bs->buffer, 1, IO_BUFFER_SIZE, bs->fp) != IO_BUFFER_SIZE)
                 return DEFLATE_ERR_IO;
+            bs->bytes_written += IO_BUFFER_SIZE;  /* FIX #14 */
             bs->pos = 0;
         }
         bs->buffer[bs->pos++] = byte;
@@ -238,6 +246,7 @@ static DeflateError bs_flush(BitStream *bs) {
     if (bs->pos > 0) {
         if (fwrite(bs->buffer, 1, bs->pos, bs->fp) != bs->pos)
             return DEFLATE_ERR_IO;
+        bs->bytes_written += bs->pos;  /* FIX #14 */
         bs->pos = 0;
     }
     return DEFLATE_OK;
@@ -245,8 +254,13 @@ static DeflateError bs_flush(BitStream *bs) {
 
 /**
  * Write 'bits' bits from 'val' (MSB-first).
+ *
+ * INVARIANT: bit_acc holds pending bits RIGHT-aligned (LSB positions).
+ * New bits are shifted in from the right. When bit_count >= 8, the
+ * MSB byte is extracted and flushed.
  */
 static DeflateError bs_write(BitStream *bs, uint64_t val, int32_t bits) {
+    DBG_ASSERT(bs->mode_write);  /* FIX #13: Catch misuse in debug builds */
     DBG_ASSERT(bits >= 0 && bits <= 64);
     if (bits < 0 || bits > 64) return DEFLATE_ERR_FORMAT;
 
@@ -261,6 +275,7 @@ static DeflateError bs_write(BitStream *bs, uint64_t val, int32_t bits) {
         if (bs->pos >= IO_BUFFER_SIZE) {
             if (fwrite(bs->buffer, 1, IO_BUFFER_SIZE, bs->fp) != IO_BUFFER_SIZE)
                 return DEFLATE_ERR_IO;
+            bs->bytes_written += IO_BUFFER_SIZE;  /* FIX #14 */
             bs->pos = 0;
         }
         bs->buffer[bs->pos++] = byte;
@@ -792,6 +807,7 @@ static int32_t decode_symbol_fast(BitStream *bs, const FastDecodeEntry *decode_t
 
 /**
  * FIX #8: Allows "./" prefix (current directory) but rejects "..".
+ * FIX #12: Use 'check' consistently after skipping "./" prefix.
  */
 static bool is_safe_path(const char *path) {
     if (!path || !path[0]) return false;
@@ -806,12 +822,12 @@ static bool is_safe_path(const char *path) {
         check += 2;
     }
 
-    /* Reject parent directory traversal */
-    if (strstr(path, "..") != NULL) return false;
+    /* FIX #12: Reject parent directory traversal - use 'check' not 'path' */
+    if (strstr(check, "..") != NULL) return false;
 
-    /* Reject dangerous characters */
-    for (const char *p = path; *p; p++) {
-        if (*p < 32 || *p == '<' || *p == '>' || *p == '|' || *p == '"')
+    /* Reject dangerous characters (including ':' for non-drive contexts) */
+    for (const char *p = check; *p; p++) {
+        if (*p < 32 || *p == '<' || *p == '>' || *p == '|' || *p == '"' || *p == ':')
             return false;
     }
 
@@ -996,12 +1012,14 @@ static DeflateError compress_file(const char *infile, const char *outfile) {
         goto compress_cleanup;
     }
 
-    /* FIX #7: Track output size via counter instead of ftell */
-    fflush(out);
-    ctx->bytes_out = 4 + 4;  /* Header + CRC, plus encoded data tracked elsewhere */
+    /* FIX #14: Accurate output size = magic(4) + bitstream + crc(4) */
+    ctx->bytes_out = 4 + bs.bytes_written + 4;
 
     printf("Compression Complete\n");
     printf("Input:  %llu bytes\n", (unsigned long long)ctx->bytes_in);
+    printf("Output: %llu bytes\n", (unsigned long long)ctx->bytes_out);
+    printf("Ratio:  %.2f%%\n", ctx->bytes_in > 0 ?
+           (100.0 * (double)ctx->bytes_out / (double)ctx->bytes_in) : 0.0);
     printf("CRC32:  0x%08X\n", crc);
 
 compress_cleanup:
