@@ -215,6 +215,25 @@ static FILE* secure_fopen_write(const char *path, bool *is_symlink) {
 }
 
 /**
+ * Check if path is a directory.
+ */
+static bool is_directory(const char *path) {
+#if PLATFORM_WINDOWS
+    DWORD attrs = GetFileAttributesA(path);
+    if (attrs != INVALID_FILE_ATTRIBUTES) {
+        return (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    }
+    return false;
+#else
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        return S_ISDIR(st.st_mode);
+    }
+    return false;
+#endif
+}
+
+/**
  * Secure read-only open (less critical but consistent API).
  */
 static FILE* secure_fopen_read(const char *path) {
@@ -971,6 +990,13 @@ static DeflateError compress_file(const char *infile, const char *outfile) {
         return DEFLATE_ERR_PATH;
     }
 
+    /* Check if input is a directory */
+    if (is_directory(infile)) {
+        fprintf(stderr, "Error: '%s' is a directory. This tool compresses single files only.\n", infile);
+        fprintf(stderr, "Hint: Use 'tar' to archive the folder first, then compress the archive.\n");
+        return DEFLATE_ERR_PATH;
+    }
+
     in = secure_fopen_read(infile);
     if (!in) {
         perror("Error opening input");
@@ -1163,6 +1189,12 @@ static DeflateError decompress_file(const char *infile, const char *outfile) {
 
     if (!is_safe_path(infile) || !is_safe_path(outfile)) {
         fprintf(stderr, "Error: Invalid file path\n");
+        return DEFLATE_ERR_PATH;
+    }
+
+    /* Check if input is a directory */
+    if (is_directory(infile)) {
+        fprintf(stderr, "Error: '%s' is a directory. Cannot decompress a directory.\n", infile);
         return DEFLATE_ERR_PATH;
     }
 
