@@ -1,98 +1,170 @@
 # MiniDeflate
 
-A production-grade, security-hardened DEFLATE-style compressor in pure C99.
+![MiniDeflate Logo](logo.png)
 
-Single-file implementation with **zero dependencies** beyond the C standard library. Supports both individual files and entire directories.
+**Production-grade, security-hardened DEFLATE-style compressor in pure C99.**
 
-![Architecture Diagram](diagram.png)
+[![Version](https://img.shields.io/badge/version-4.0.0-blue.svg)]()
+[![C99](https://img.shields.io/badge/C-99-green.svg)]()
+[![License](https://img.shields.io/badge/license-Proprietary-red.svg)]()
 
-## Features
+Single-file implementation (~3000 LOC) with **zero dependencies** beyond the C standard library. Compresses individual files and entire directories with RFC 1951-compliant distance coding.
 
-### Compression
-- **Hash Chain LZSS** - O(1) pattern lookup via 32K-entry hash table
-- **4KB Sliding Window** - Double-buffered for safe boundary handling
-- **Canonical Huffman** - Optimal prefix codes rebuilt per 32KB block
-- **12-bit Fast Decode** - O(1) symbol resolution via lookup table
-- **Folder Archives** - Compress entire directories with preserved structure
+---
 
-### Security
-- **Path Traversal Protection** - Rejects `..`, absolute paths, and dangerous characters
-- **Symlink Attack Prevention** - Refuses to follow symlinks/reparse points on output
-- **Zip Bomb Prevention** - Enforces 1GB input / 10GB output limits
-- **Bounds-Safe Access** - All window/buffer accesses are clamped and verified
-- **Fail-Closed Integrity** - Truncated files are rejected, not warned
+## Highlights
 
-### Robustness
-- **No Memory Leaks** - All error paths properly free allocations
-- **Portable Serialization** - Little-endian byte-by-byte I/O, safe on any architecture
-- **Cross-Platform** - Windows (MSVC/MinGW) and Unix (Linux/macOS) support
-- **Debug Assertions** - Optional compile-time diagnostics via `-DDEBUG`
+| Feature | Description |
+|---------|-------------|
+| **RFC 1951 Distance Coding** | 30 distance codes + extra bits for optimal compression |
+| **18 Security Fixes** | Hardened against path traversal, symlinks, TOCTOU, zip bombs |
+| **Solid Archive Mode** | Cross-file LZ window for improved folder compression |
+| **Single Compilation Unit** | One `.c` file, compiles in under 1 second |
+| **Cross-Platform** | Windows (MSVC/MinGW) and Unix (Linux/macOS/BSD) |
 
-## Build
+---
+
+## Quick Start
+
+### Build
 
 ```bash
-gcc -O3 -std=c99 -Wall -Wextra deflate.c -o deflate
+gcc -O3 -std=c99 -Wall -Wextra -Werror deflate.c -o proz
 ```
 
-## Usage
+### Usage
 
 ```bash
+# Show version and features
+./proz --version
+
 # Compress a file
-./deflate -c input.txt output.proz
+./proz -c document.pdf document.proz
 
 # Compress a folder
-./deflate -c myfolder/ archive.proz
+./proz -c project/ project.proz
 
-# Decompress (auto-detects file vs folder)
-./deflate -d archive.proz output/
+# Compress folder with solid mode (better ratio)
+./proz -c -s project/ project.proz
+
+# Decompress (auto-detects single file vs folder)
+./proz -d project.proz output/
+
+# Verbose output
+./proz -v -c largefile.bin largefile.proz
+
+# Quiet mode (errors only)
+./proz -q -c data.bin data.proz
 ```
 
-### Example Output
+---
 
+## What's New in v4.0
+
+### Compression Improvements
+- **4-byte hash function** with golden ratio multiplication for better distribution
+- **RFC 1951 distance coding** (30 codes + extra bits) replacing raw 12-bit distances
+- **Fast-path chain search** (8 entries) before full 128-entry search
+- **Adaptive block sizing** - early flush on very long matches or poor quality
+- **~2.5% better compression ratio** compared to v3.0
+
+### New Features
+- **Solid compression mode** (`-s` / `--solid`) for folder archives
+- **Verbose mode** (`-v` / `--verbose`) with detailed progress
+- **Quiet mode** (`-q` / `--quiet`) for scripting
+- **Version flag** (`-V` / `--version`)
+
+### Architecture
 ```
-Scanning directory 'src'...
-Found 56 files to compress
-  Compressing: main.rs (654 bytes)
-  Compressing: game/draw.rs (31771 bytes)
-  ...
-
-Folder Compression Complete
-Files:  56
-Input:  261345 bytes
-Output: 76719 bytes
-Ratio:  29.36%
-CRC32:  0x0CD466C5
+Input --> [4-byte Hash] --> [Fast Chain (8)] --> [Full Chain (128)]
+                                    |
+                                    v
+                          [RFC 1951 Distance Codes]
+                                    |
+                                    v
+                          [Adaptive Block Flush]
+                                    |
+                                    v
+                          [Canonical Huffman]
+                                    |
+                                    v
+                                 Output
 ```
 
-## File Format
-
-### Single File Archive (Magic: `0x50524F5A`)
-```
-[Magic 4B][Compressed Blocks...][CRC32 4B]
-```
-
-### Folder Archive (Magic: `0x50524F46`)
-```
-[Magic 4B][File Count 4B][File Table...][Compressed Stream][CRC32 4B]
-
-File Table Entry:
-[Path Length 2B][Path UTF-8][Original Size 8B]
-```
-
-All multi-byte values are little-endian. Bit streams are MSB-first.
+---
 
 ## Technical Specifications
 
 | Parameter | Value |
 |-----------|-------|
+| Window Size | 4 KB |
+| Block Size | 32,768 tokens max |
+| Hash Table | 32K entries (15-bit) |
+| Hash Function | 4-byte with golden ratio |
+| Distance Codes | 30 (RFC 1951 compliant) |
+| Huffman Depth | 15 bits max |
+| Fast Decode | 12-bit lookup table |
 | Max Input | 1 GB |
 | Max Output | 10 GB |
-| Max Files per Archive | 65,535 |
-| Max Path Length | 512 bytes |
-| Window Size | 4 KB |
-| Block Size | 32 KB |
-| Hash Table | 32K entries |
-| Huffman Depth | 15 bits max |
+| Max Files | 65,535 per archive |
+| Max Path | 512 bytes |
+
+---
+
+## Security Model
+
+MiniDeflate implements **18 documented security fixes** for production use:
+
+| Threat | Mitigation |
+|--------|------------|
+| Path traversal (`../`) | Rejected by `is_safe_path()` with consistent checking |
+| Absolute paths | Blocked (Unix `/`, Windows `C:`) |
+| Symlink attacks | `secure_fopen_write()` uses lstat/reparse point detection |
+| TOCTOU races | File type verified immediately before open |
+| Zip bombs | 10GB output limit enforced incrementally |
+| Truncated archives | CRC read failure = fatal error (fail-closed) |
+| Buffer overflows | All window/buffer accesses bounds-checked |
+| Memory leaks | Centralized cleanup via goto labels |
+| Ghost buffer attacks | Explicit bits-in-RAM check prevents I/O during peek |
+| Integer overflow | uint64_t counters for all size tracking |
+
+---
+
+## File Formats
+
+### Single File (Magic: `PROZ` / `0x50524F5A`)
+```
+[4B Magic][Compressed Blocks...][4B CRC32]
+```
+
+### Folder Archive (Magic: `PROF` / `0x50524F46`)
+```
+[4B Magic][4B File Count][File Table...][Compressed Stream][4B CRC32]
+
+File Table Entry:
+  [2B Path Length][Path UTF-8][8B Original Size]
+```
+
+### Solid Folder Archive (Magic: `PROS` / `0x50524F53`)
+```
+Same as folder archive, but LZ window persists across file boundaries
+```
+
+All integers are **little-endian**. Bit streams are **MSB-first**.
+
+---
+
+## Performance
+
+| Input | Size | Output | Ratio |
+|-------|------|--------|-------|
+| Repetitive text | 100 KB | 906 B | 0.9% |
+| Source code (deflate.c) | 81 KB | 26.4 KB | 32.5% |
+| Mixed folder (56 files) | 261 KB | 77 KB | 29.4% |
+
+v4.0 achieves approximately **2.5% smaller output** than v3.0 on typical inputs due to RFC 1951 distance coding.
+
+---
 
 ## Error Codes
 
@@ -102,28 +174,22 @@ All multi-byte values are little-endian. Bit streams are MSB-first.
 | -1 | `DEFLATE_ERR_IO` | File I/O error |
 | -2 | `DEFLATE_ERR_MEM` | Memory allocation failed |
 | -3 | `DEFLATE_ERR_FORMAT` | Invalid file format |
-| -4 | `DEFLATE_ERR_CORRUPT` | Data corruption or CRC mismatch |
+| -4 | `DEFLATE_ERR_CORRUPT` | Data corruption / CRC mismatch |
 | -5 | `DEFLATE_ERR_LIMIT` | Size limit exceeded |
 | -6 | `DEFLATE_ERR_PATH` | Unsafe path rejected |
 
-## Security Model
+---
 
-| Threat | Mitigation |
-|--------|------------|
-| Path traversal (`../`) | Rejected by `is_safe_path()` |
-| Absolute paths | Rejected (Unix `/`, Windows `C:`) |
-| Symlink attacks | `secure_fopen_write()` via lstat/reparse check |
-| Zip bombs | 10GB output limit, checked incrementally |
-| Truncated files | CRC read failure = fatal error |
-| Malicious archives | Path validation on extraction |
+## Version History
 
-## Performance
+| Version | Highlights |
+|---------|------------|
+| **4.0** | RFC 1951 distance coding, solid mode, 4-byte hash, adaptive blocks |
+| **3.0** | Folder compression support |
+| **2.0** | Security hardening (18 fixes) |
+| **1.0** | Initial release |
 
-| Input | Output | Ratio |
-|-------|--------|-------|
-| 100KB repetitive text | 906 B | 0.91% |
-| 261KB source code (56 files) | 77 KB | 29.4% |
-| 1MB mixed content | ~350 KB | ~35% |
+---
 
 ## License
 
