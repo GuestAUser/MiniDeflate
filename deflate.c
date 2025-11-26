@@ -8,6 +8,16 @@
  *        gcc -O3 -std=c99 -Wall -Wextra -DDEBUG deflate.c -o deflate_debug
  *
  * Creator: GuestAUser(Lk10)
+ *
+ * POSIX feature test macros - must be defined before any includes.
+ * Required for lstat(), opendir(), readdir() visibility in strict C99 mode.
+ */
+#if !defined(_WIN32)
+#define _XOPEN_SOURCE 700
+#define _DEFAULT_SOURCE
+#endif
+
+/*
  * ============================================================================
  * SECURITY HARDENING (18 fixes):
  * ----------------------------------------------------------------------------
@@ -50,8 +60,8 @@
 #include <stdarg.h>
 
 /* Version info */
-#define PROZ_VERSION "4.0.0"
-#define PROZ_NAME "proz"
+#define MINIDEFATE_VERSION "4.0.0"
+#define MINIDEFATE_NAME "MiniDeflate"
 
 /* FIX #17: Platform-specific includes for secure file operations */
 #ifdef _WIN32
@@ -64,6 +74,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <errno.h>
 #define PLATFORM_WINDOWS 0
 #endif
 
@@ -440,22 +451,23 @@ static bool create_directory_recursive(const char *path) {
 /* Recursive directory traversal */
 #if PLATFORM_WINDOWS
 static bool traverse_directory(const char *base_path, const char *rel_path, FileList *fl) {
-    char search_path[MAX_PATH_LEN];
-    char full_path[MAX_PATH_LEN];
+    char search_path[MAX_PATH_LEN * 2 + 4];
+    char full_path[MAX_PATH_LEN * 2 + 2];
     char new_rel[MAX_PATH_LEN];
     WIN32_FIND_DATAA ffd;
     HANDLE hFind;
 
     if (rel_path[0]) {
-        snprintf(search_path, MAX_PATH_LEN, "%s/%s/*", base_path, rel_path);
+        snprintf(search_path, sizeof(search_path), "%s/%s/*", base_path, rel_path);
     } else {
-        snprintf(search_path, MAX_PATH_LEN, "%s/*", base_path);
+        snprintf(search_path, sizeof(search_path), "%s/*", base_path);
     }
     normalize_path(search_path);
 
     /* Convert back to backslash for Windows API */
-    char win_search[MAX_PATH_LEN];
-    strncpy(win_search, search_path, MAX_PATH_LEN);
+    char win_search[MAX_PATH_LEN * 2 + 4];
+    strncpy(win_search, search_path, sizeof(win_search) - 1);
+    win_search[sizeof(win_search) - 1] = '\0';
     for (char *p = win_search; *p; p++) {
         if (*p == '/') *p = '\\';
     }
@@ -480,7 +492,7 @@ static bool traverse_directory(const char *base_path, const char *rel_path, File
         normalize_path(new_rel);
 
         /* Build full path */
-        snprintf(full_path, MAX_PATH_LEN, "%s/%s", base_path, new_rel);
+        snprintf(full_path, sizeof(full_path), "%s/%s", base_path, new_rel);
         normalize_path(full_path);
 
         if (ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
@@ -504,20 +516,19 @@ static bool traverse_directory(const char *base_path, const char *rel_path, File
 }
 #else
 #include <dirent.h>
-#include <errno.h>
 
 static bool traverse_directory(const char *base_path, const char *rel_path, FileList *fl) {
-    char dir_path[MAX_PATH_LEN];
-    char full_path[MAX_PATH_LEN];
+    char dir_path[MAX_PATH_LEN * 2 + 2];
+    char full_path[MAX_PATH_LEN * 2 + 2];
     char new_rel[MAX_PATH_LEN];
     DIR *dir;
     struct dirent *entry;
     struct stat st;
 
     if (rel_path[0]) {
-        snprintf(dir_path, MAX_PATH_LEN, "%s/%s", base_path, rel_path);
+        snprintf(dir_path, sizeof(dir_path), "%s/%s", base_path, rel_path);
     } else {
-        snprintf(dir_path, MAX_PATH_LEN, "%s", base_path);
+        snprintf(dir_path, sizeof(dir_path), "%s", base_path);
     }
 
     dir = opendir(dir_path);
@@ -537,7 +548,7 @@ static bool traverse_directory(const char *base_path, const char *rel_path, File
         }
 
         /* Build full path */
-        snprintf(full_path, MAX_PATH_LEN, "%s/%s", base_path, new_rel);
+        snprintf(full_path, sizeof(full_path), "%s/%s", base_path, new_rel);
 
         if (stat(full_path, &st) != 0) {
             continue;
@@ -1185,7 +1196,7 @@ static DeflateError build_huffman_codes(const uint64_t *freqs, CanonicalEntry *t
         }
 
         for (int32_t i = 1; i < 32; i++) {
-            code = (code + bl_count[i - 1]) << 1;
+            code = (code + (uint64_t)bl_count[i - 1]) << 1;
             next_code[i] = code;
         }
 
@@ -1557,14 +1568,14 @@ static DeflateError compress_file(const char *infile, const char *outfile) {
                 ctx->token_buf[tok_count].val = (uint16_t)((match_len - 3) + 257);
 
                 uint16_t dist = (read_pos - match_pos) & WINDOW_MASK;
-                uint8_t dist_code;
-                uint16_t dist_extra;
-                uint8_t dist_extra_bits;
-                dist_to_code(dist, &dist_code, &dist_extra, &dist_extra_bits);
+                uint8_t d_code;
+                uint16_t d_extra;
+                uint8_t d_extra_bits;
+                dist_to_code(dist, &d_code, &d_extra, &d_extra_bits);
 
-                ctx->token_buf[tok_count].dist_code = dist_code;
-                ctx->token_buf[tok_count].dist_extra = dist_extra;
-                ctx->token_buf[tok_count].dist_extra_bits = dist_extra_bits;
+                ctx->token_buf[tok_count].dist_code = d_code;
+                ctx->token_buf[tok_count].dist_extra = d_extra;
+                ctx->token_buf[tok_count].dist_extra_bits = d_extra_bits;
 
                 crc = update_crc32(ctx->crc_table, crc, &ctx->window[read_pos], (size_t)match_len);
             }
@@ -1644,8 +1655,10 @@ static DeflateError compress_file(const char *infile, const char *outfile) {
     LOG_VERBOSE_MSG("CRC32:  0x%08X\n", crc);
 
 compress_cleanup:
-    SAFE_FREE(ctx->token_buf);
-    if (ctx) free(ctx);
+    if (ctx) {
+        SAFE_FREE(ctx->token_buf);
+        free(ctx);
+    }
     if (in) fclose(in);
     if (out) fclose(out);
     return result;
@@ -1761,14 +1774,14 @@ static DeflateError compress_folder(const char *folder_path, const char *outfile
     uint64_t total_bytes_in = 0;
     uint32_t current_file = 0;
     uint64_t current_file_remaining = 0;
-    char full_path[MAX_PATH_LEN];
+    char full_path[MAX_PATH_LEN * 2 + 2];
     bool file_boundary_crossed = false;
 
     /* Process all files */
     while (current_file < fl->count || bytes_in_window > 0) {
         /* Open next file if needed */
         if (!in && current_file < fl->count) {
-            snprintf(full_path, MAX_PATH_LEN, "%s/%s", folder_path, fl->entries[current_file].path);
+            snprintf(full_path, sizeof(full_path), "%s/%s", folder_path, fl->entries[current_file].path);
             normalize_path(full_path);
 
             in = secure_fopen_read(full_path);
@@ -1813,7 +1826,7 @@ static DeflateError compress_folder(const char *folder_path, const char *outfile
 
                 /* Open next file */
                 if (current_file < fl->count) {
-                    snprintf(full_path, MAX_PATH_LEN, "%s/%s", folder_path, fl->entries[current_file].path);
+                    snprintf(full_path, sizeof(full_path), "%s/%s", folder_path, fl->entries[current_file].path);
                     normalize_path(full_path);
 
                     in = secure_fopen_read(full_path);
@@ -1882,14 +1895,14 @@ static DeflateError compress_folder(const char *folder_path, const char *outfile
                 ctx->token_buf[tok_count].val = (uint16_t)((match_len - 3) + 257);
 
                 uint16_t dist = (read_pos - match_pos) & WINDOW_MASK;
-                uint8_t dist_code;
-                uint16_t dist_extra;
-                uint8_t dist_extra_bits;
-                dist_to_code(dist, &dist_code, &dist_extra, &dist_extra_bits);
+                uint8_t d_code;
+                uint16_t d_extra;
+                uint8_t d_extra_bits;
+                dist_to_code(dist, &d_code, &d_extra, &d_extra_bits);
 
-                ctx->token_buf[tok_count].dist_code = dist_code;
-                ctx->token_buf[tok_count].dist_extra = dist_extra;
-                ctx->token_buf[tok_count].dist_extra_bits = dist_extra_bits;
+                ctx->token_buf[tok_count].dist_code = d_code;
+                ctx->token_buf[tok_count].dist_extra = d_extra;
+                ctx->token_buf[tok_count].dist_extra_bits = d_extra_bits;
 
                 crc = update_crc32(ctx->crc_table, crc, &ctx->window[read_pos], (size_t)match_len);
             }
@@ -1914,7 +1927,7 @@ static DeflateError compress_folder(const char *folder_path, const char *outfile
 
                     /* Open next file */
                     if (current_file < fl->count) {
-                        snprintf(full_path, MAX_PATH_LEN, "%s/%s", folder_path, fl->entries[current_file].path);
+                        snprintf(full_path, sizeof(full_path), "%s/%s", folder_path, fl->entries[current_file].path);
                         normalize_path(full_path);
                         in = secure_fopen_read(full_path);
                         if (in) {
@@ -1996,8 +2009,10 @@ static DeflateError compress_folder(const char *folder_path, const char *outfile
     LOG_VERBOSE_MSG("CRC32:  0x%08X\n", crc);
 
 folder_compress_cleanup:
-    SAFE_FREE(ctx->token_buf);
-    if (ctx) free(ctx);
+    if (ctx) {
+        SAFE_FREE(ctx->token_buf);
+        free(ctx);
+    }
     if (in) fclose(in);
     if (out) fclose(out);
     filelist_destroy(fl);
@@ -2121,7 +2136,7 @@ static DeflateError decompress_file(const char *infile, const char *outfile) {
         }
 
         for (int32_t i = 1; i < 32; i++) {
-            code = (code + bl_count[i - 1]) << 1;
+            code = (code + (uint64_t)bl_count[i - 1]) << 1;
             next_code[i] = code;
         }
 
@@ -2236,9 +2251,11 @@ static DeflateError decompress_file(const char *infile, const char *outfile) {
     LOG_VERBOSE_MSG("Integrity Verified: OK\n");
 
 decompress_cleanup:
-    SAFE_FREE(ctx->decode_table);
-    SAFE_FREE(ctx->decomp_window);
-    if (ctx) free(ctx);
+    if (ctx) {
+        SAFE_FREE(ctx->decode_table);
+        SAFE_FREE(ctx->decomp_window);
+        free(ctx);
+    }
     if (in) fclose(in);
     if (out) fclose(out);
     return result;
@@ -2428,7 +2445,7 @@ static DeflateError decompress_folder(const char *infile, const char *out_dir, b
         }
 
         for (int32_t i = 1; i < 32; i++) {
-            code = (code + bl_count[i - 1]) << 1;
+            code = (code + (uint64_t)bl_count[i - 1]) << 1;
             next_code[i] = code;
         }
 
@@ -2607,9 +2624,11 @@ static DeflateError decompress_folder(const char *infile, const char *out_dir, b
     LOG_VERBOSE_MSG("Integrity Verified: OK\n");
 
 folder_decompress_cleanup:
-    SAFE_FREE(ctx->decode_table);
-    SAFE_FREE(ctx->decomp_window);
-    if (ctx) free(ctx);
+    if (ctx) {
+        SAFE_FREE(ctx->decode_table);
+        SAFE_FREE(ctx->decomp_window);
+        free(ctx);
+    }
     if (in) fclose(in);
     if (out) fclose(out);
     filelist_destroy(fl);
@@ -2649,13 +2668,13 @@ static DeflateError decompress_auto(const char *infile, const char *output) {
 /* ==================== USAGE AND VERSION ==================== */
 
 static void print_version(void) {
-    printf("%s version %s\n", PROZ_NAME, PROZ_VERSION);
+    printf("%s version %s\n", MINIDEFATE_NAME, MINIDEFATE_VERSION);
     printf("Production-grade DEFLATE-style compressor with security hardening.\n");
     printf("Features: RFC 1951 distance coding, solid archive mode, adaptive blocks.\n");
 }
 
 static void print_usage(const char *prog) {
-    printf("%s - Production-Grade DEFLATE Compressor v%s\n\n", PROZ_NAME, PROZ_VERSION);
+    printf("%s - Production-Grade DEFLATE Compressor v%s\n\n", MINIDEFATE_NAME, MINIDEFATE_VERSION);
     printf("Usage: %s [OPTIONS] -c|-d <input> <output>\n\n", prog);
     printf("Options:\n");
     printf("  -c, --compress    Compress file or folder\n");

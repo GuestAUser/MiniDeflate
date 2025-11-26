@@ -70,32 +70,32 @@ All in **~3000 lines of dependency-free C99**.
 ### Build
 
 ```bash
-gcc -O3 -std=c99 -Wall -Wextra -Werror deflate.c -o proz
+gcc -O3 -std=c99 -Wall -Wextra -Werror deflate.c -o deflate
 ```
 
 ### Usage
 
 ```bash
 # Show version and features
-./proz --version
+./deflate --version
 
 # Compress a file
-./proz -c document.pdf document.proz
+./deflate -c document.pdf document.proz
 
 # Compress a folder
-./proz -c project/ project.proz
+./deflate -c project/ project.proz
 
 # Compress folder with solid mode (better ratio)
-./proz -c -s project/ project.proz
+./deflate -c -s project/ project.proz
 
 # Decompress (auto-detects single file vs folder)
-./proz -d project.proz output/
+./deflate -d project.proz output/
 
 # Verbose output
-./proz -v -c largefile.bin largefile.proz
+./deflate -v -c largefile.bin largefile.proz
 
 # Quiet mode (errors only)
-./proz -q -c data.bin data.proz
+./deflate -q -c data.bin data.proz
 ```
 
 ---
