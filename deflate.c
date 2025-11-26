@@ -4,8 +4,8 @@
  * A secure, high-performance hybrid compressor using LZSS + Canonical Huffman.
  * Implements RFC 1951 distance coding for improved compression ratios.
  *
- * Build: gcc -O3 -std=c99 -Wall -Wextra -Werror deflate.c -o proz
- *        gcc -O3 -std=c99 -Wall -Wextra -DDEBUG deflate.c -o proz_debug
+ * Build: gcc -O3 -std=c99 -Wall -Wextra -Werror deflate.c -o deflate
+ *        gcc -O3 -std=c99 -Wall -Wextra -DDEBUG deflate.c -o deflate_debug
  *
  * Creator: GuestAUser(Lk10)
  * ============================================================================
