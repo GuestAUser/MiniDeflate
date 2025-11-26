@@ -50,7 +50,7 @@ While miniz focuses on being minimal, MiniDeflate delivers production-grade feat
 | Cross-Platform | Sometimes | **Windows + Unix** |
 | Professional CLI | Rare | **Yes** (-q, -v, --version) |
 
-Most single-file compressors on side-projects or incomplete implementations, that's why they do not get where it's supposed to be. MiniDeflate is production-ready.
+Most single-file compressors are on side-projects or incomplete implementations, that's why they do not get where it's supposed to be. MiniDeflate is production-ready.
 
 ### Commercial-Grade Features
 
@@ -249,3 +249,4 @@ v4.0 achieves approximately **2.5% smaller output** than v3.0 on typical inputs 
 Copyright (c) 2025 [GuestAUser](https://github.com/GuestAUser). All rights reserved.
 
 Proprietary software. Unauthorized copying, modification, distribution, or use is strictly prohibited without prior written permission from the copyright holder.
+
