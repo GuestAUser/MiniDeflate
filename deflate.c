@@ -145,7 +145,7 @@
 
 /* Adaptive block thresholds */
 #define ADAPTIVE_MIN_TOKENS   16384
-#define ADAPTIVE_LONG_MATCH   1000
+#define ADAPTIVE_LONG_MATCH   200
 #define ADAPTIVE_POOR_MATCH   4
 
 /* Distance coding: 30 codes per RFC 1951 */
@@ -1260,12 +1260,62 @@ static DeflateError build_huffman_codes(const uint64_t *freqs, CanonicalEntry *t
         uint64_t next_code[32];
 
         for (int32_t i = 0; i < SYMBOL_COUNT; i++) {
-            if (depths[i] > 0) {
-                if (depths[i] > MAX_HUFFMAN_DEPTH) {
-                    result = DEFLATE_ERR_FORMAT;
-                    goto cleanup;
+            if (depths[i] > 0) bl_count[depths[i]]++;
+        }
+
+        /* Length-limited Huffman: redistribute codes exceeding MAX_HUFFMAN_DEPTH.
+         * This uses the JPEG Annex K / DEFLATE approach: move overflow codes to
+         * the max legal depth, then fix Kraft inequality violations by promoting
+         * codes from the deepest level upward until the tree is valid. */
+        {
+            int32_t overflow = 0;
+            for (int32_t d = MAX_HUFFMAN_DEPTH + 1; d < 32; d++) {
+                overflow += bl_count[d];
+                bl_count[d] = 0;
+            }
+            bl_count[MAX_HUFFMAN_DEPTH] += overflow;
+
+            /* Adjust until Kraft inequality is satisfied (left == 0) */
+            int32_t left = 1;
+            for (int32_t d = 1; d <= MAX_HUFFMAN_DEPTH; d++) {
+                left = (left << 1) - bl_count[d];
+            }
+            while (left < 0) {
+                for (int32_t d = MAX_HUFFMAN_DEPTH - 1; d >= 1 && left < 0; d--) {
+                    if (bl_count[d] > 0) {
+                        bl_count[d]--;
+                        bl_count[d + 1] += 2;
+                        bl_count[MAX_HUFFMAN_DEPTH]--;
+                        left++;
+                    }
                 }
-                bl_count[depths[i]]++;
+            }
+
+            /* Reassign depths to symbols based on corrected bl_count.
+             * Symbols are assigned in order of decreasing tree depth
+             * (longest codes first), preserving canonical ordering. */
+            int32_t sym_by_depth[SYMBOL_COUNT];
+            int32_t nsyms = 0;
+            for (int32_t i = 0; i < SYMBOL_COUNT; i++) {
+                if (depths[i] > 0) sym_by_depth[nsyms++] = i;
+            }
+            /* Sort by depth descending (simple insertion sort — nsyms <= 513) */
+            for (int32_t i = 1; i < nsyms; i++) {
+                int32_t key = sym_by_depth[i];
+                uint8_t kd = depths[key];
+                int32_t j = i - 1;
+                while (j >= 0 && depths[sym_by_depth[j]] < kd) {
+                    sym_by_depth[j + 1] = sym_by_depth[j];
+                    j--;
+                }
+                sym_by_depth[j + 1] = key;
+            }
+
+            int32_t si = 0;
+            for (int32_t d = MAX_HUFFMAN_DEPTH; d >= 1; d--) {
+                for (int32_t c2 = 0; c2 < bl_count[d] && si < nsyms; c2++) {
+                    depths[sym_by_depth[si++]] = (uint8_t)d;
+                }
             }
         }
 
@@ -1468,16 +1518,9 @@ static bool is_safe_path(const char *path) {
  * Returns true if we should end the current block.
  */
 static bool should_flush_block_early(int32_t tok_count, int32_t match_len) {
-    /* Always flush on very long matches to capture good compression */
-    if (match_len >= ADAPTIVE_LONG_MATCH) {
-        return true;
-    }
-
-    /* Flush when we have many tokens and current match is poor */
-    if (tok_count >= ADAPTIVE_MIN_TOKENS && match_len <= ADAPTIVE_POOR_MATCH) {
-        return true;
-    }
-
+    if (tok_count < ADAPTIVE_MIN_TOKENS) return false;
+    if (match_len >= ADAPTIVE_LONG_MATCH) return true;
+    if (match_len <= ADAPTIVE_POOR_MATCH) return true;
     return false;
 }
 
@@ -1995,13 +2038,19 @@ static DeflateError compress_folder(const char *folder_path, const char *outfile
                     ctx->window[write_pos + WINDOW_SIZE] = (uint8_t)c;
                     write_pos = (write_pos + 1) & WINDOW_MASK;
                     total_bytes_in++;
+
+                    if (total_bytes_in > MAX_INPUT_SIZE) {
+                        LOG_ERR("Error: Total input exceeds %llu byte limit\n",
+                                (unsigned long long)MAX_INPUT_SIZE);
+                        result = DEFLATE_ERR_LIMIT;
+                        goto folder_compress_cleanup;
+                    }
                 } else {
                     bytes_in_window--;
                 }
 
                 read_pos = (read_pos + 1) & WINDOW_MASK;
 
-                /* In solid mode, only clear hash on wrap; in non-solid, already handled */
                 if (read_pos == 0) {
                     memset(ctx->hash_chain.head, 0xFF, sizeof(ctx->hash_chain.head));
                 }
@@ -2685,6 +2734,27 @@ static DeflateError decompress_folder(const char *infile, const char *out_dir, b
         result = DEFLATE_ERR_IO;
         goto folder_decompress_cleanup;
     }
+
+    /* Create any remaining files that received zero bytes (empty trailing files) */
+    while (current_file < file_count &&
+           current_file_written >= fl->entries[current_file].size) {
+        if (out) { wbuf_flush(&wb); fclose(out); out = NULL; }
+        current_file++;
+        current_file_written = 0;
+        if (current_file < file_count) {
+            bool is_symlink = false;
+            out = secure_extract_open(out_dir, fl->entries[current_file].path, &is_symlink);
+            if (!out) {
+                LOG_ERR("Error: Cannot create '%s'%s\n", fl->entries[current_file].path,
+                        is_symlink ? " (symlink in path)" : "");
+                result = is_symlink ? DEFLATE_ERR_PATH : DEFLATE_ERR_IO;
+                goto folder_decompress_cleanup;
+            }
+            wbuf_init(&wb, out);
+            LOG_VERBOSE_MSG("  Extracting: %s\n", fl->entries[current_file].path);
+        }
+    }
+    if (out) { wbuf_flush(&wb); fclose(out); out = NULL; }
 
     uint32_t file_crc;
     if (!bs_read_aligned_uint32(&bs, &file_crc)) {
