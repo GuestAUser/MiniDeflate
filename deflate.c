@@ -255,6 +255,20 @@ typedef struct HuffmanNode {
 } HuffmanNode;
 
 typedef struct {
+    HuffmanNode pool[SYMBOL_COUNT * 2];
+    int32_t next;
+} HuffmanArena;
+
+static void arena_init(HuffmanArena *a) { a->next = 0; }
+
+static HuffmanNode* arena_alloc(HuffmanArena *a) {
+    if (a->next >= SYMBOL_COUNT * 2) return NULL;
+    HuffmanNode *n = &a->pool[a->next++];
+    n->sym = -1; n->freq = 0; n->left = n->right = NULL;
+    return n;
+}
+
+typedef struct {
     HuffmanNode **nodes;
     int32_t size;
     int32_t capacity;
@@ -263,7 +277,7 @@ typedef struct {
 typedef struct {
     uint16_t sym;
     uint8_t len;
-    uint64_t code;
+    uint16_t code;
 } CanonicalEntry;
 
 typedef struct {
@@ -312,6 +326,7 @@ static void wbuf_init(WriteBuf *wb, FILE *fp) {
 }
 
 static void wbuf_put(WriteBuf *wb, uint8_t byte) {
+    if (wb->error) return;
     wb->buf[wb->pos++] = byte;
     if (wb->pos >= IO_BUFFER_SIZE) {
         if (fwrite(wb->buf, 1, IO_BUFFER_SIZE, wb->fp) != IO_BUFFER_SIZE)
@@ -357,8 +372,7 @@ typedef struct {
 
 #define SAFE_FREE(ptr) do { if (ptr) { free(ptr); ptr = NULL; } } while(0)
 
-/* Forward declaration for heap_destroy */
-static void free_tree(HuffmanNode *root);
+/* Forward declarations removed: free_tree and heap_destroy eliminated by arena allocator */
 
 /* ==================== SECURE FILE I/O ==================== */
 
@@ -461,7 +475,7 @@ static FILE* secure_extract_open(const char *out_dir, const char *rel_path, bool
             int new_fd = openat(dir_fd, start, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
             close(dir_fd);
             if (new_fd < 0) {
-                if (errno == ELOOP) *is_symlink = true;
+                if (errno == ELOOP || errno == ENOTDIR) *is_symlink = true;
                 return NULL;
             }
             dir_fd = new_fd;
@@ -477,7 +491,7 @@ static FILE* secure_extract_open(const char *out_dir, const char *rel_path, bool
     int file_fd = openat(dir_fd, start, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0644);
     close(dir_fd);
     if (file_fd < 0) {
-        if (errno == ELOOP) *is_symlink = true;
+        if (errno == ELOOP || errno == ENOTDIR) *is_symlink = true;
         return NULL;
     }
 
@@ -927,68 +941,63 @@ static DeflateError bs_write(BitStream *bs, uint64_t val, int32_t bits) {
 /**
  * Read single bit (MSB-first). Returns -1 on EOF.
  */
-static int32_t bs_read_bit(BitStream *bs) {
-    if (bs->bit_count == 0) {
+/* Refill bit_acc from buffer until we have >= 'need' bits or hit EOF.
+ * bit_acc stores bits MSB-aligned: the next bit to consume is at position
+ * (bit_count - 1). Returns false if EOF reached before satisfying 'need'. */
+static bool bs_refill(BitStream *bs, int32_t need) {
+    while (bs->bit_count < need) {
+        if (bs->bit_count > 56) break;  /* prevent uint64_t overflow on shift */
         if (bs->pos >= bs->bytes_in_buf) {
             bs->bytes_in_buf = fread(bs->buffer, 1, IO_BUFFER_SIZE, bs->fp);
             bs->pos = 0;
-            if (bs->bytes_in_buf == 0) return -1;
+            if (bs->bytes_in_buf == 0) return false;
         }
-        bs->bit_acc = bs->buffer[bs->pos++];
-        bs->bit_count = 8;
+        bs->bit_acc = (bs->bit_acc << 8) | bs->buffer[bs->pos++];
+        bs->bit_count += 8;
     }
-    int32_t bit = (bs->bit_acc >> 7) & 1;
-    bs->bit_acc <<= 1;
+    return bs->bit_count >= need;
+}
+
+static int32_t bs_read_bit(BitStream *bs) {
+    if (!bs_refill(bs, 1)) return -1;
     bs->bit_count--;
-    return bit;
+    return (int32_t)((bs->bit_acc >> bs->bit_count) & 1);
 }
 
-/**
- * FIX #6: Read multiple bits with mandatory error reporting.
- * Caller MUST provide non-NULL error pointer.
- */
 static uint32_t bs_read_bits(BitStream *bs, int32_t bits, bool *error) {
-    DBG_ASSERT(error != NULL);  /* FIX #6: error must not be NULL */
+    DBG_ASSERT(error != NULL);
     *error = false;
+    if (bits <= 0 || bits > 32) { *error = (bits != 0); return 0; }
 
-    if (bits < 0 || bits > 32) {
-        *error = true;
-        return 0;
-    }
-
-    uint32_t val = 0;
-    for (int32_t i = 0; i < bits; i++) {
-        int32_t b = bs_read_bit(bs);
-        if (b == -1) {
-            *error = true;
-            return 0;
-        }
-        val = (val << 1) | (uint32_t)b;
-    }
-    return val;
+    if (!bs_refill(bs, bits)) { *error = true; return 0; }
+    bs->bit_count -= bits;
+    return (uint32_t)((bs->bit_acc >> bs->bit_count) & ((1ULL << bits) - 1));
 }
 
-/**
- * Read 32-bit value at byte boundary (little-endian).
- *
- * INVARIANT: Discards any pending partial byte by setting bit_count = 0.
- * This is correct because the encoder pads to byte boundary in bs_flush
- * before writing the CRC footer. Caller must ensure the stream is at a
- * known byte-aligned position (e.g., after EOB symbol).
- */
+/* Read 32-bit LE value at byte boundary. Discards sub-byte padding bits,
+ * then drains any whole bytes remaining in bit_acc before reading from
+ * the I/O buffer. This is necessary because bs_refill may have pulled
+ * CRC footer bytes into bit_acc ahead of time. */
 static bool bs_read_aligned_uint32(BitStream *bs, uint32_t *out) {
-    bs->bit_count = 0;  /* Discard partial byte - see invariant above */
+    int32_t discard = bs->bit_count % 8;
+    bs->bit_count -= discard;
+
     uint32_t res = 0;
     for (int i = 0; i < 4; i++) {
-        if (bs->pos >= bs->bytes_in_buf) {
-            bs->bytes_in_buf = fread(bs->buffer, 1, IO_BUFFER_SIZE, bs->fp);
-            bs->pos = 0;
-            if (bs->bytes_in_buf == 0) {
-                *out = res;
-                return false;  /* Incomplete read */
+        if (bs->bit_count >= 8) {
+            bs->bit_count -= 8;
+            res |= (uint32_t)((bs->bit_acc >> bs->bit_count) & 0xFF) << (i * 8);
+        } else {
+            if (bs->pos >= bs->bytes_in_buf) {
+                bs->bytes_in_buf = fread(bs->buffer, 1, IO_BUFFER_SIZE, bs->fp);
+                bs->pos = 0;
+                if (bs->bytes_in_buf == 0) {
+                    *out = res;
+                    return false;
+                }
             }
+            res |= ((uint32_t)bs->buffer[bs->pos++] << (i * 8));
         }
-        res |= ((uint32_t)bs->buffer[bs->pos++] << (i * 8));
     }
     *out = res;
     return true;
@@ -1069,99 +1078,44 @@ static void find_best_match(const DeflateContext *ctx, uint16_t pos,
     uint8_t first = ctx->window[pos];
     uint8_t second = ctx->window[pos + 1];
 
-    /* Fast-path: short chain search first */
-    int32_t fast_chain_limit = FAST_CHAIN_LENGTH;
-    bool found_good_match = false;
+    int32_t chain_limit = FAST_CHAIN_LENGTH;
+    for (int phase = 0; phase < 2; phase++) {
+        while (chain != 0xFFFF && chain < WINDOW_SIZE && chain_count++ < chain_limit) {
+            int32_t distance = (pos - chain) & WINDOW_MASK;
+            if (distance == 0) break;
 
-    while (chain != 0xFFFF && chain < WINDOW_SIZE && chain_count++ < fast_chain_limit) {
-        int32_t distance = (pos - chain) & WINDOW_MASK;
-        if (distance == 0) break;
-
-        /* Skip stale entries */
-        if (distance > WINDOW_SIZE - MAX_MATCH) {
-            chain = ctx->hash_chain.prev[chain];
-            continue;
-        }
-
-        /* FIX #5: Bounds check for chain position */
-        int32_t chain_max_len = max_len;
-        if (chain + chain_max_len > WINDOW_SIZE * 2) {
-            chain_max_len = WINDOW_SIZE * 2 - chain;
-        }
-        if (chain_max_len < MIN_MATCH) {
-            chain = ctx->hash_chain.prev[chain];
-            continue;
-        }
-
-        /* Quick rejection test */
-        if (ctx->window[chain] == first && ctx->window[chain + 1] == second) {
-            int32_t len = 2;
-            int32_t safe_max = (chain_max_len < max_len) ? chain_max_len : max_len;
-
-            /* FIX #5: Additional bounds assertion in debug mode */
-            DBG_ASSERT(chain + safe_max <= WINDOW_SIZE * 2);
-            DBG_ASSERT(pos + safe_max <= WINDOW_SIZE * 2);
-
-            while (len < safe_max && ctx->window[chain + len] == ctx->window[pos + len]) {
-                len++;
+            if (distance > WINDOW_SIZE - MAX_MATCH) {
+                chain = ctx->hash_chain.prev[chain];
+                continue;
             }
 
-            if (len > *match_len) {
-                *match_len = len;
-                *match_pos = chain;
-                /* If we found a good match in fast path, we might stop early */
-                if (len >= 32 || len >= MAX_MATCH) {
-                    found_good_match = true;
-                    break;
+            int32_t chain_max_len = max_len;
+            if (chain + chain_max_len > WINDOW_SIZE * 2)
+                chain_max_len = WINDOW_SIZE * 2 - chain;
+            if (chain_max_len < MIN_MATCH) {
+                chain = ctx->hash_chain.prev[chain];
+                continue;
+            }
+
+            if (ctx->window[chain] == first && ctx->window[chain + 1] == second) {
+                int32_t safe_max = (chain_max_len < max_len) ? chain_max_len : max_len;
+                DBG_ASSERT(chain + safe_max <= WINDOW_SIZE * 2);
+                DBG_ASSERT(pos + safe_max <= WINDOW_SIZE * 2);
+
+                int32_t len = 2;
+                while (len < safe_max && ctx->window[chain + len] == ctx->window[pos + len])
+                    len++;
+
+                if (len > *match_len) {
+                    *match_len = len;
+                    *match_pos = chain;
+                    if (len >= MAX_MATCH) return;
+                    if (phase == 0 && len >= 32) { phase = 1; break; }
                 }
             }
-        }
-        chain = ctx->hash_chain.prev[chain];
-    }
-
-    /* If fast path found excellent match, skip full search */
-    if (found_good_match && *match_len >= MAX_MATCH) return;
-
-    /* Full search if fast path didn't find great match */
-    while (chain != 0xFFFF && chain < WINDOW_SIZE && chain_count++ < MAX_CHAIN_LENGTH) {
-        int32_t distance = (pos - chain) & WINDOW_MASK;
-        if (distance == 0) break;
-
-        /* Skip stale entries */
-        if (distance > WINDOW_SIZE - MAX_MATCH) {
             chain = ctx->hash_chain.prev[chain];
-            continue;
         }
-
-        /* FIX #5: Bounds check for chain position */
-        int32_t chain_max_len = max_len;
-        if (chain + chain_max_len > WINDOW_SIZE * 2) {
-            chain_max_len = WINDOW_SIZE * 2 - chain;
-        }
-        if (chain_max_len < MIN_MATCH) {
-            chain = ctx->hash_chain.prev[chain];
-            continue;
-        }
-
-        /* Quick rejection test */
-        if (ctx->window[chain] == first && ctx->window[chain + 1] == second) {
-            int32_t len = 2;
-            int32_t safe_max = (chain_max_len < max_len) ? chain_max_len : max_len;
-
-            DBG_ASSERT(chain + safe_max <= WINDOW_SIZE * 2);
-            DBG_ASSERT(pos + safe_max <= WINDOW_SIZE * 2);
-
-            while (len < safe_max && ctx->window[chain + len] == ctx->window[pos + len]) {
-                len++;
-            }
-
-            if (len > *match_len) {
-                *match_len = len;
-                *match_pos = chain;
-                if (len >= MAX_MATCH) break;
-            }
-        }
-        chain = ctx->hash_chain.prev[chain];
+        chain_limit = MAX_CHAIN_LENGTH;
     }
 }
 
@@ -1180,19 +1134,8 @@ static MinHeap* heap_create(int32_t cap) {
     return h;
 }
 
-/**
- * FIX #15: Free any HuffmanNode pointers still in heap on error cleanup.
- * Previously only freed the array, leaking nodes on early exit.
- */
-static void heap_destroy(MinHeap *h) {
-    if (!h) return;
-    /* Free any nodes remaining in heap (e.g., after allocation failure) */
-    for (int32_t i = 0; i < h->size; i++) {
-        free_tree(h->nodes[i]);  /* Recursively frees subtrees if any */
-    }
-    free(h->nodes);
-    free(h);
-}
+/* heap_destroy removed: arena allocator owns all HuffmanNode memory now.
+ * Heap struct is freed directly in build_huffman_codes cleanup. */
 
 /**
  * FIX #2: Returns false on overflow instead of silently failing.
@@ -1254,114 +1197,63 @@ static void get_tree_depths(HuffmanNode *root, int32_t depth, uint8_t *lens) {
     get_tree_depths(root->right, depth + 1, lens);
 }
 
-static void free_tree(HuffmanNode *root) {
-    if (!root) return;
-    free_tree(root->left);
-    free_tree(root->right);
-    free(root);
-}
+/* free_tree removed: arena allocator owns all HuffmanNode memory */
 
-/**
- * FIX #3 & #10: Centralized cleanup via goto; no memory leaks.
- */
 static DeflateError build_huffman_codes(const uint64_t *freqs, CanonicalEntry *table,
-                                        uint8_t *depths, uint16_t *max_sym_out) {
+                                         uint8_t *depths, uint16_t *max_sym_out) {
     MinHeap *h = NULL;
     HuffmanNode *root = NULL;
+    HuffmanArena arena;
     DeflateError result = DEFLATE_OK;
 
+    arena_init(&arena);
     h = heap_create(SYMBOL_COUNT * 2);
     if (!h) return DEFLATE_ERR_MEM;
 
     memset(depths, 0, SYMBOL_COUNT);
     *max_sym_out = 0;
 
-    /* Build initial leaf nodes */
     for (int32_t i = 0; i < SYMBOL_COUNT; i++) {
         if (freqs[i] > 0) {
-            HuffmanNode *n = malloc(sizeof(HuffmanNode));
-            if (!n) {
-                result = DEFLATE_ERR_MEM;
-                goto cleanup;
-            }
+            HuffmanNode *n = arena_alloc(&arena);
+            if (!n) { result = DEFLATE_ERR_MEM; goto cleanup; }
             n->sym = i;
             n->freq = freqs[i];
-            n->left = n->right = NULL;
-
-            /* FIX #2: Check heap_push return value */
-            if (!heap_push(h, n)) {
-                free(n);
-                result = DEFLATE_ERR_MEM;
-                goto cleanup;
-            }
+            if (!heap_push(h, n)) { result = DEFLATE_ERR_MEM; goto cleanup; }
             *max_sym_out = (uint16_t)i;
         }
     }
 
-    if (h->size == 0) {
-        result = DEFLATE_ERR_FORMAT;
-        goto cleanup;
-    }
+    if (h->size == 0) { result = DEFLATE_ERR_FORMAT; goto cleanup; }
 
-    /* Handle single-symbol case */
     if (h->size == 1) {
         HuffmanNode *n = heap_pop(h);
-        HuffmanNode *dummy = malloc(sizeof(HuffmanNode));
-        HuffmanNode *parent = malloc(sizeof(HuffmanNode));
-
-        if (!dummy || !parent) {
-            free_tree(n);
-            free(dummy);
-            free(parent);
-            result = DEFLATE_ERR_MEM;
-            goto cleanup;
-        }
+        HuffmanNode *dummy = arena_alloc(&arena);
+        HuffmanNode *parent = arena_alloc(&arena);
+        if (!dummy || !parent) { result = DEFLATE_ERR_MEM; goto cleanup; }
 
         dummy->sym = (n->sym == 0) ? 1 : 0;
-        dummy->freq = 0;
-        dummy->left = dummy->right = NULL;
-
-        parent->sym = -1;
         parent->freq = n->freq;
         parent->left = n;
         parent->right = dummy;
-
-        if (!heap_push(h, parent)) {
-            free_tree(parent);  /* Frees n and dummy too */
-            result = DEFLATE_ERR_MEM;
-            goto cleanup;
-        }
+        if (!heap_push(h, parent)) { result = DEFLATE_ERR_MEM; goto cleanup; }
     }
 
-    /* Build Huffman tree */
     while (h->size > 1) {
         HuffmanNode *l = heap_pop(h);
         HuffmanNode *r = heap_pop(h);
-        HuffmanNode *parent = malloc(sizeof(HuffmanNode));
+        HuffmanNode *parent = arena_alloc(&arena);
+        if (!parent) { result = DEFLATE_ERR_MEM; goto cleanup; }
 
-        if (!parent) {
-            free_tree(l);
-            free_tree(r);
-            result = DEFLATE_ERR_MEM;
-            goto cleanup;
-        }
-
-        parent->sym = -1;
         parent->freq = l->freq + r->freq;
         parent->left = l;
         parent->right = r;
-
-        if (!heap_push(h, parent)) {
-            free_tree(parent);
-            result = DEFLATE_ERR_MEM;
-            goto cleanup;
-        }
+        if (!heap_push(h, parent)) { result = DEFLATE_ERR_MEM; goto cleanup; }
     }
 
     root = heap_pop(h);
     get_tree_depths(root, 0, depths);
 
-    /* Build canonical codes */
     {
         int32_t bl_count[32] = {0};
         uint64_t code = 0;
@@ -1392,8 +1284,8 @@ static DeflateError build_huffman_codes(const uint64_t *freqs, CanonicalEntry *t
     }
 
 cleanup:
-    free_tree(root);
-    heap_destroy(h);
+    /* Arena nodes are stack-allocated — no free needed. Only free heap struct. */
+    if (h) { free(h->nodes); free(h); }
     return result;
 }
 
@@ -1477,78 +1369,23 @@ static DeflateError build_fast_decode_table(FastDecodeEntry *decode_table,
     return DEFLATE_OK;
 }
 
-/**
- * FIX #16: Save/restore bytes_in_buf along with other state during peek.
- * FIX #18: Explicit guard to ensure NO buffer refill occurs during peek.
- *
- * SECURITY NOTE (Ghost Buffer Prevention):
- * The fast-path peek reads bits speculatively then restores state. If a buffer
- * refill (fread) occurred during peek, the buffer contents change and restoration
- * would leave us reading from wrong data. The available_bits check ensures we
- * have enough bits IN RAM to complete the peek without I/O.
- */
+/* Zero-copy fast decode: peek FAST_DECODE_BITS from bit_acc without
+ * save/restore. The batched bs_refill keeps bits in bit_acc so peeking
+ * is a single shift+mask. Ghost buffer issue is eliminated because
+ * bs_refill is called once upfront, not speculatively during peek. */
 static int32_t decode_symbol_fast(BitStream *bs, const FastDecodeEntry *decode_table,
-                                  const CanonicalEntry *table, int32_t t_count) {
-    /*
-     * FIX #18: Calculate bits available WITHOUT triggering I/O.
-     * This is the critical security invariant: we only enter fast path
-     * if all required bits are already in memory (bit_acc + buffer).
-     */
-    int32_t bits_in_ram = (bs->pos <= bs->bytes_in_buf)
-        ? bs->bit_count + 8 * (int32_t)(bs->bytes_in_buf - bs->pos)
-        : bs->bit_count;
-
-    /* SECURITY: Only proceed if we can peek without disk I/O */
-    if (bits_in_ram >= FAST_DECODE_BITS) {
-        uint32_t peek = 0;
-
-        /* FIX #16: Save ALL mutable state that bs_read_bit can modify */
-        uint32_t orig_bit_count = (uint32_t)bs->bit_count;
-        uint64_t orig_bit_acc = bs->bit_acc;
-        size_t orig_pos = bs->pos;
-        size_t orig_bytes_in_buf = bs->bytes_in_buf;
-
-        for (int32_t i = 0; i < FAST_DECODE_BITS; i++) {
-            int32_t b = bs_read_bit(bs);
-            /*
-             * FIX #18: If we get EOF here, something is wrong - we calculated
-             * that we had enough bits. This indicates buffer corruption.
-             */
-            if (b == -1) {
-                DBG_PRINTF("Ghost buffer: unexpected EOF during peek\n");
-                return -1;
-            }
-            peek = (peek << 1) | (uint32_t)b;
+                                   const CanonicalEntry *table, int32_t t_count) {
+    if (bs_refill(bs, FAST_DECODE_BITS)) {
+        uint32_t peek = (uint32_t)((bs->bit_acc >> (bs->bit_count - FAST_DECODE_BITS))
+                        & (FAST_DECODE_SIZE - 1));
+        FastDecodeEntry entry = decode_table[peek];
+        if (entry.bits_used > 0 && entry.bits_used <= FAST_DECODE_BITS) {
+            bs->bit_count -= entry.bits_used;
+            return entry.symbol;
         }
-
-        /*
-         * FIX #18: Verify no buffer refill occurred (defense in depth).
-         * If bytes_in_buf changed, a refill happened and our state is corrupt.
-         */
-        DBG_ASSERT(bs->bytes_in_buf == orig_bytes_in_buf &&
-                   "Ghost buffer detected: refill during peek!");
-
-        if (peek < FAST_DECODE_SIZE) {
-            FastDecodeEntry entry = decode_table[peek];
-            if (entry.bits_used > 0 && entry.bits_used <= FAST_DECODE_BITS) {
-                /* Restore state and consume only needed bits */
-                bs->bit_count = (int32_t)orig_bit_count;
-                bs->bit_acc = orig_bit_acc;
-                bs->pos = orig_pos;
-                bs->bytes_in_buf = orig_bytes_in_buf;
-                for (int32_t i = 0; i < entry.bits_used; i++) bs_read_bit(bs);
-                return entry.symbol;
-            }
-        }
-
-        /* Restore state for slow path */
-        bs->bit_count = (int32_t)orig_bit_count;
-        bs->bit_acc = orig_bit_acc;
-        bs->pos = orig_pos;
-        bs->bytes_in_buf = orig_bytes_in_buf;
     }
 
-    /* Slow path: bit-by-bit decoding */
+    /* Slow path: bit-by-bit decoding for codes longer than FAST_DECODE_BITS */
     uint64_t curr_code = 0;
     int32_t curr_len = 0;
 
@@ -1570,15 +1407,20 @@ static int32_t decode_symbol_fast(BitStream *bs, const FastDecodeEntry *decode_t
     return -1;
 }
 
-/* FIX #21: Validate Huffman code lengths form a valid prefix-free code */
+/* FIX #21: Validate Huffman code lengths form a valid prefix-free code.
+ * FIX #27: Also reject undersubscribed trees (left > 0) to prevent CPU
+ * amplification via undecodable bit patterns in the slow-path decoder.
+ * Exception: single-symbol trees are inherently undersubscribed (left == 1). */
 static bool validate_huffman_lengths(const int32_t *bl_count, int32_t max_bits) {
     int32_t left = 1;
+    int32_t total_codes = 0;
     for (int32_t bits = 1; bits <= max_bits; bits++) {
         left <<= 1;
         left -= bl_count[bits];
+        total_codes += bl_count[bits];
         if (left < 0) return false;
     }
-    return true;
+    return left == 0 || (left == 1 && total_codes == 1);
 }
 
 /* ==================== PATH SECURITY ==================== */
@@ -1744,6 +1586,13 @@ static DeflateError compress_file(const char *infile, const char *outfile) {
 
     uint32_t crc = 0;
     ctx->bytes_out = 4;  /* Magic header */
+
+    /* FIX #25: Empty file — emit a single block with only EOB so decompressor
+     * sees a valid last-block instead of reading CRC bytes as block data. */
+    if (bytes_in_window == 0) {
+        result = encode_block(ctx, &bs, 0, true);
+        if (result != DEFLATE_OK) goto compress_cleanup;
+    }
 
     /* Main compression loop */
     while (bytes_in_window > 0) {
@@ -2179,6 +2028,12 @@ static DeflateError compress_folder(const char *folder_path, const char *outfile
         if (result != DEFLATE_OK) goto folder_compress_cleanup;
     }
 
+    /* FIX #25: If all files were empty, no blocks were emitted — write one */
+    if (bs.bytes_written == 0 && bs.bit_count == 0) {
+        result = encode_block(ctx, &bs, 0, true);
+        if (result != DEFLATE_OK) goto folder_compress_cleanup;
+    }
+
     /* Finalize */
     result = bs_flush(&bs);
     if (result != DEFLATE_OK) goto folder_compress_cleanup;
@@ -2188,7 +2043,12 @@ static DeflateError compress_folder(const char *folder_path, const char *outfile
         goto folder_compress_cleanup;
     }
 
-    ctx->bytes_out = 8 + bs.bytes_written + 4;  /* Header + data + CRC */
+    /* FIX #26: Account for file table size in bytes_out */
+    uint64_t file_table_bytes = 0;
+    for (uint32_t i = 0; i < fl->count; i++) {
+        file_table_bytes += 2 + strlen(fl->entries[i].path) + 8;
+    }
+    ctx->bytes_out = 8 + file_table_bytes + bs.bytes_written + 4;
 
     LOG_NORMAL_MSG("\nFolder Compression Complete%s\n", g_solid_mode ? " (solid)" : "");
     LOG_NORMAL_MSG("Files:  %u\n", fl->count);
@@ -2419,12 +2279,22 @@ static DeflateError decompress_file(const char *infile, const char *outfile) {
                 total_output += (uint64_t)len;
 
                 uint16_t src = (window_pos - (uint16_t)dist) & WINDOW_MASK;
+                uint16_t crc_start = window_pos;
                 for (int32_t i = 0; i < len; i++) {
                     uint8_t c = ctx->decomp_window[(src + i) & WINDOW_MASK];
                     wbuf_put(&wb, c);
-                    calc_crc = update_crc32(&ctx->crc_tables, calc_crc, &c, 1);
                     ctx->decomp_window[window_pos] = c;
                     window_pos = (window_pos + 1) & WINDOW_MASK;
+                }
+                if (crc_start + len <= WINDOW_SIZE) {
+                    calc_crc = update_crc32(&ctx->crc_tables, calc_crc,
+                                            &ctx->decomp_window[crc_start], (size_t)len);
+                } else {
+                    uint16_t first = WINDOW_SIZE - crc_start;
+                    calc_crc = update_crc32(&ctx->crc_tables, calc_crc,
+                                            &ctx->decomp_window[crc_start], first);
+                    calc_crc = update_crc32(&ctx->crc_tables, calc_crc,
+                                            &ctx->decomp_window[0], (size_t)len - first);
                 }
             }
         }
@@ -2479,6 +2349,11 @@ static DeflateError decompress_folder(const char *infile, const char *out_dir, b
     DeflateContext *ctx = NULL;
     FileList *fl = NULL;
     DeflateError result = DEFLATE_OK;
+
+    if (!out_dir || !out_dir[0]) {
+        LOG_ERR("Error: Invalid output directory\n");
+        return DEFLATE_ERR_PATH;
+    }
 
     in = secure_fopen_read(infile);
     if (!in) {
@@ -2907,12 +2782,14 @@ static void print_usage(const char *prog) {
 /* ==================== MAIN ==================== */
 
 int main(int argc, char *argv[]) {
+    g_log_level = LOG_NORMAL;
+    g_solid_mode = false;
+
     if (argc < 2) {
         print_usage(argv[0]);
         return 1;
     }
 
-    /* Parse command line arguments */
     bool do_compress = false;
     bool do_decompress = false;
     const char *input_path = NULL;
