@@ -141,6 +141,7 @@
 #define MAX_OUTPUT_SIZE       ((uint64_t)50 * 1024 * 1024 * 1024)
 #define MAX_HUFFMAN_DEPTH     15
 #define MAX_DECODE_ITERATIONS 64
+#define MAX_BLOCKS            4000000
 
 /* Adaptive block thresholds */
 #define ADAPTIVE_MIN_TOKENS   16384
@@ -209,7 +210,12 @@ static const uint8_t dist_extra_bits[NUM_DIST_CODES] = {
 
 /* Convert distance to code + extra bits */
 static void dist_to_code(uint16_t dist, uint8_t *code_out, uint16_t *extra_out, uint8_t *extra_bits_out) {
-    /* Binary search for distance code */
+    if (dist == 0) {
+        *code_out = 0;
+        *extra_out = 0;
+        *extra_bits_out = 0;
+        return;
+    }
     int lo = 0, hi = NUM_DIST_CODES - 1;
     while (lo < hi) {
         int mid = (lo + hi + 1) / 2;
@@ -227,7 +233,9 @@ static void dist_to_code(uint16_t dist, uint8_t *code_out, uint16_t *extra_out, 
 /* Convert code + extra bits to distance */
 static uint16_t code_to_dist(uint8_t code, uint16_t extra) {
     if (code >= NUM_DIST_CODES) return 0;
-    return dist_base[code] + extra;
+    uint32_t dist = (uint32_t)dist_base[code] + (uint32_t)extra;
+    if (dist > UINT16_MAX) return 0;
+    return (uint16_t)dist;
 }
 
 /* ==================== DATA STRUCTURES ==================== */
@@ -853,15 +861,12 @@ static DeflateError bs_flush(BitStream *bs) {
 
     /* Flush any remaining bits (pad with zeros) */
     while (bs->bit_count > 0) {
-        int32_t bits_to_write = (bs->bit_count >= 8) ? 8 : bs->bit_count;
-        int32_t shift = bs->bit_count - bits_to_write;
         uint8_t byte;
-
         if (bs->bit_count < 8) {
-            /* Partial byte: shift left to align MSB, pad LSB with zeros */
             byte = (uint8_t)(bs->bit_acc << (8 - bs->bit_count));
             bs->bit_count = 0;
         } else {
+            int32_t shift = bs->bit_count - 8;
             byte = (uint8_t)((bs->bit_acc >> shift) & 0xFF);
             bs->bit_count -= 8;
         }
@@ -897,8 +902,10 @@ static DeflateError bs_write(BitStream *bs, uint64_t val, int32_t bits) {
     DBG_ASSERT(bs->mode_write);  /* FIX #13: Catch misuse in debug builds */
     DBG_ASSERT(bits >= 0 && bits <= 64);
     if (bits < 0 || bits > 64) return DEFLATE_ERR_FORMAT;
+    if (bits == 0) return DEFLATE_OK;
 
-    bs->bit_acc = (bs->bit_acc << bits) | (val & ((1ULL << bits) - 1));
+    uint64_t mask = (bits < 64) ? ((1ULL << bits) - 1) : UINT64_MAX;
+    bs->bit_acc = (bs->bit_acc << bits) | (val & mask);
     bs->bit_count += bits;
 
     while (bs->bit_count >= 8) {
@@ -2273,8 +2280,15 @@ static DeflateError decompress_file(const char *infile, const char *outfile) {
     uint32_t calc_crc = 0;
     uint64_t total_output = 0;
     bool last_block = false;
+    uint32_t block_count = 0;
 
     while (!last_block) {
+        if (++block_count > MAX_BLOCKS) {
+            LOG_ERR("Error: Block count exceeds %u limit\n", (unsigned)MAX_BLOCKS);
+            result = DEFLATE_ERR_LIMIT;
+            goto decompress_cleanup;
+        }
+
         bool read_err = false;
 
         int32_t last_bit = bs_read_bit(&bs);
@@ -2569,6 +2583,7 @@ static DeflateError decompress_folder(const char *infile, const char *out_dir, b
     uint32_t calc_crc = 0;
     uint64_t total_output = 0;
     bool last_block = false;
+    uint32_t block_count = 0;
     WriteBuf wb;
     memset(&wb, 0, sizeof(wb));
 
@@ -2589,6 +2604,12 @@ static DeflateError decompress_folder(const char *infile, const char *out_dir, b
     }
 
     while (!last_block) {
+        if (++block_count > MAX_BLOCKS) {
+            LOG_ERR("Error: Block count exceeds limit\n");
+            result = DEFLATE_ERR_LIMIT;
+            goto folder_decompress_cleanup;
+        }
+
         bool read_err = false;
 
         int32_t last_bit = bs_read_bit(&bs);
