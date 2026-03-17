@@ -4,12 +4,12 @@
 
 **Production-grade, security-hardened DEFLATE-style compressor in pure C99.**
 
-[![Version](https://img.shields.io/badge/version-4.0.0-blue.svg)]()
+[![Version](https://img.shields.io/badge/version-5.0.0-blue.svg)]()
 [![C99](https://img.shields.io/badge/C-99-green.svg)]()
 [![License](https://img.shields.io/badge/license-Proprietary-red.svg)]()
 [![Security](https://img.shields.io/badge/CVEs-0-brightgreen.svg)]()
 
-Single-file implementation (~3000 LOC) with **zero dependencies** beyond the C standard library. Compresses individual files and entire directories with RFC 1951-compliant distance coding.
+Single-file implementation (~3100 LOC) with **zero dependencies** beyond the C standard library. Compresses individual files and entire directories with RFC 1951-compliant distance coding.
 
 ---
 
@@ -22,8 +22,8 @@ Single-file implementation (~3000 LOC) with **zero dependencies** beyond the C s
 | Known CVEs | 10+ historical vulnerabilities | **0** |
 | Symlink Protection | No | **Yes** (lstat/reparse detection) |
 | TOCTOU Prevention | No | **Yes** (fail-closed verification) |
-| Path Traversal | Vulnerable | **Blocked** (18 documented fixes) |
-| Zip Bomb Protection | Limited | **Yes** (10GB enforced limit) |
+| Path Traversal | Vulnerable | **Blocked** (21 documented fixes) |
+| Zip Bomb Protection | Limited | **Yes** (50GB enforced limit) |
 
 MiniDeflate was designed security-first. Every input path, output path, and archive entry is validated. Symlinks are detected and rejected. Race conditions are eliminated with fail-closed checks.
 
@@ -35,7 +35,7 @@ MiniDeflate was designed security-first. Every input path, output path, and arch
 | Distance Coding | Simplified | **RFC 1951 compliant (30 codes)** |
 | Folder Archives | No | **Yes** |
 | Solid Mode | No | **Yes** |
-| Security Hardening | Minimal | **18 documented fixes** |
+| Security Hardening | Minimal | **21 documented fixes** |
 
 While miniz focuses on being minimal, MiniDeflate delivers production-grade features without sacrificing the single-file simplicity.
 
@@ -46,7 +46,7 @@ While miniz focuses on being minimal, MiniDeflate delivers production-grade feat
 | Full DEFLATE Distance Coding | Rare | **Yes** |
 | Folder/Archive Support | Rare | **Yes** |
 | Solid Compression | Almost None | **Yes** |
-| Security Hardening | Almost None | **18 fixes** |
+| Security Hardening | Almost None | **21 fixes** |
 | Cross-Platform | Sometimes | **Windows + Unix** |
 | Professional CLI | Rare | **Yes** (-q, -v, --version) |
 
@@ -61,7 +61,7 @@ MiniDeflate matches commercial compression tools in:
 - **Reliability** - CRC32 integrity, fail-closed design, zero memory leaks
 - **Usability** - Professional CLI with quiet/verbose modes
 
-All in **~3000 lines of dependency-free C99**.
+All in **~3100 lines of dependency-free C99**.
 
 ---
 
@@ -105,23 +105,40 @@ gcc -O3 -std=c99 -Wall -Wextra -Werror deflate.c -o deflate
 | Feature | Description |
 |---------|-------------|
 | **RFC 1951 Distance Coding** | 30 distance codes + extra bits for optimal compression |
-| **18 Security Fixes** | Hardened against path traversal, symlinks, TOCTOU, zip bombs |
+| **21 Security Fixes** | Hardened against path traversal, symlinks, TOCTOU, zip bombs |
 | **Solid Archive Mode** | Cross-file LZ window for improved folder compression |
 | **Single Compilation Unit** | One `.c` file, compiles in under 1 second |
 | **Cross-Platform** | Windows (MSVC/MinGW) and Unix (Linux/macOS/BSD) |
 
 ---
 
-## What's New in v4.0
+## What's New in v5.0
 
-### Compression Improvements
+### Performance
+- **CRC32 slice-by-4** — processes 4 bytes at a time (~3-4x faster integrity checking)
+- **64KB I/O buffers** — 4x larger than v4.0 for better throughput
+- **Lock-free I/O** — `getc_unlocked`/`putc_unlocked` on POSIX (eliminates per-byte mutex)
+- **Buffered decompression output** — WriteBuf replaces per-byte fputc
+- **memset hash chain reset** — replaces 32K-iteration loops
+
+### Limits (5x increase)
+- **25 GB input** (was 1 GB)
+- **50 GB output** (was 10 GB)
+
+### Security (3 new fixes, 21 total)
+- **O_NOFOLLOW atomic symlink rejection** — closes TOCTOU gap between lstat and fopen (FIX #19)
+- **Embedded null byte detection** — prevents path truncation attacks in archives (FIX #20)
+- **Huffman tree oversubscription validation** — rejects malformed code tables (FIX #21)
+- **Filelist capacity overflow protection** — safe integer arithmetic on growth
+
+### v4.0 Compression Improvements
 - **4-byte hash function** with golden ratio multiplication for better distribution
 - **RFC 1951 distance coding** (30 codes + extra bits) replacing raw 12-bit distances
 - **Fast-path chain search** (8 entries) before full 128-entry search
 - **Adaptive block sizing** - early flush on very long matches or poor quality
 - **~2.5% better compression ratio** compared to v3.0
 
-### New Features
+### v4.0 Features
 - **Solid compression mode** (`-s` / `--solid`) for folder archives
 - **Verbose mode** (`-v` / `--verbose`) with detailed progress
 - **Quiet mode** (`-q` / `--quiet`) for scripting
@@ -157,8 +174,10 @@ Input --> [4-byte Hash] --> [Fast Chain (8)] --> [Full Chain (128)]
 | Distance Codes | 30 (RFC 1951 compliant) |
 | Huffman Depth | 15 bits max |
 | Fast Decode | 12-bit lookup table |
-| Max Input | 1 GB |
-| Max Output | 10 GB |
+| I/O Buffer | 64 KB |
+| CRC32 | Slice-by-4 (4KB tables) |
+| Max Input | 25 GB |
+| Max Output | 50 GB |
 | Max Files | 65,535 per archive |
 | Max Path | 512 bytes |
 
@@ -166,7 +185,7 @@ Input --> [4-byte Hash] --> [Fast Chain (8)] --> [Full Chain (128)]
 
 ## Security Model
 
-MiniDeflate implements **18 documented security fixes** for production use:
+MiniDeflate implements **21 documented security fixes** for production use:
 
 | Threat | Mitigation |
 |--------|------------|
@@ -174,12 +193,15 @@ MiniDeflate implements **18 documented security fixes** for production use:
 | Absolute paths | Blocked (Unix `/`, Windows `C:`) |
 | Symlink attacks | `secure_fopen_write()` uses lstat/reparse point detection |
 | TOCTOU races | File type verified immediately before open |
-| Zip bombs | 10GB output limit enforced incrementally |
+| Zip bombs | 50GB output limit enforced incrementally |
 | Truncated archives | CRC read failure = fatal error (fail-closed) |
 | Buffer overflows | All window/buffer accesses bounds-checked |
 | Memory leaks | Centralized cleanup via goto labels |
 | Ghost buffer attacks | Explicit bits-in-RAM check prevents I/O during peek |
 | Integer overflow | uint64_t counters for all size tracking |
+| Embedded null bytes | Detected and rejected in archive paths |
+| Malformed Huffman | Oversubscription validation on all code tables |
+| TOCTOU symlinks | O_NOFOLLOW atomic rejection (v5.0) |
 
 ---
 
@@ -211,11 +233,12 @@ All integers are **little-endian**. Bit streams are **MSB-first**.
 
 | Input | Size | Output | Ratio |
 |-------|------|--------|-------|
-| Repetitive text | 100 KB | 906 B | 0.9% |
-| Source code (deflate.c) | 81 KB | 26.4 KB | 32.5% |
-| Mixed folder (56 files) | 261 KB | 77 KB | 29.4% |
+| Repetitive text | 130 KB | 784 B | 0.6% |
+| Source code (deflate.c) | 97 KB | 32.6 KB | 33.6% |
+| Random data | 512 KB | 528 KB | 100.8% |
+| Zero-filled | 512 KB | 1.8 KB | 0.3% |
 
-v4.0 achieves approximately **2.5% smaller output** than v3.0 on typical inputs due to RFC 1951 distance coding.
+v5.0 includes CRC32 slice-by-4 and buffered I/O for improved throughput on large files.
 
 ---
 
@@ -237,6 +260,7 @@ v4.0 achieves approximately **2.5% smaller output** than v3.0 on typical inputs 
 
 | Version | Highlights |
 |---------|------------|
+| **5.0** | 5x limits, CRC32 slice-by-4, buffered I/O, O_NOFOLLOW, Huffman validation |
 | **4.0** | RFC 1951 distance coding, solid mode, 4-byte hash, adaptive blocks |
 | **3.0** | Folder compression support |
 | **2.0** | Security hardening (18 fixes) |
