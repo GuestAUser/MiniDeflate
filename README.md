@@ -20,9 +20,9 @@ Single-file implementation (~3100 LOC) with **zero dependencies** beyond the C s
 | | zlib | MiniDeflate |
 |--|------|-------------|
 | Known CVEs | 10+ historical vulnerabilities | **0** |
-| Symlink Protection | No | **Yes** (lstat/reparse detection) |
-| TOCTOU Prevention | No | **Yes** (fail-closed verification) |
-| Path Traversal | Vulnerable | **Blocked** (21 documented fixes) |
+| Symlink Protection | No | **Yes** (openat/O_NOFOLLOW at all path levels) |
+| TOCTOU Prevention | No | **Yes** (atomic openat on POSIX, best-effort on Windows) |
+| Path Traversal | Vulnerable | **Blocked** (24 documented fixes) |
 | Zip Bomb Protection | Limited | **Yes** (50GB enforced limit) |
 
 MiniDeflate was designed security-first. Every input path, output path, and archive entry is validated. Symlinks are detected and rejected. Race conditions are eliminated with fail-closed checks.
@@ -35,7 +35,7 @@ MiniDeflate was designed security-first. Every input path, output path, and arch
 | Distance Coding | Simplified | **RFC 1951 compliant (30 codes)** |
 | Folder Archives | No | **Yes** |
 | Solid Mode | No | **Yes** |
-| Security Hardening | Minimal | **21 documented fixes** |
+| Security Hardening | Minimal | **24 documented fixes** |
 
 While miniz focuses on being minimal, MiniDeflate delivers production-grade features without sacrificing the single-file simplicity.
 
@@ -46,7 +46,7 @@ While miniz focuses on being minimal, MiniDeflate delivers production-grade feat
 | Full DEFLATE Distance Coding | Rare | **Yes** |
 | Folder/Archive Support | Rare | **Yes** |
 | Solid Compression | Almost None | **Yes** |
-| Security Hardening | Almost None | **21 fixes** |
+| Security Hardening | Almost None | **24 fixes** |
 | Cross-Platform | Sometimes | **Windows + Unix** |
 | Professional CLI | Rare | **Yes** (-q, -v, --version) |
 
@@ -105,7 +105,7 @@ gcc -O3 -std=c99 -Wall -Wextra -Werror deflate.c -o deflate
 | Feature | Description |
 |---------|-------------|
 | **RFC 1951 Distance Coding** | 30 distance codes + extra bits for optimal compression |
-| **21 Security Fixes** | Hardened against path traversal, symlinks, TOCTOU, zip bombs |
+| **24 Security Fixes** | Hardened against path traversal, symlinks, TOCTOU, zip bombs |
 | **Solid Archive Mode** | Cross-file LZ window for improved folder compression |
 | **Single Compilation Unit** | One `.c` file, compiles in under 1 second |
 | **Cross-Platform** | Windows (MSVC/MinGW) and Unix (Linux/macOS/BSD) |
@@ -125,11 +125,13 @@ gcc -O3 -std=c99 -Wall -Wextra -Werror deflate.c -o deflate
 - **25 GB input** (was 1 GB)
 - **50 GB output** (was 10 GB)
 
-### Security (3 new fixes, 21 total)
-- **O_NOFOLLOW atomic symlink rejection** — closes TOCTOU gap between lstat and fopen (FIX #19)
+### Security (6 new fixes, 24 total)
+- **O_NOFOLLOW atomic symlink rejection** — closes TOCTOU gap on leaf files (FIX #19)
 - **Embedded null byte detection** — prevents path truncation attacks in archives (FIX #20)
 - **Huffman tree oversubscription validation** — rejects malformed code tables (FIX #21)
-- **Filelist capacity overflow protection** — safe integer arithmetic on growth
+- **openat-based extraction** — rejects symlinks at ALL path levels, not just the leaf (FIX #22)
+- **Component-wise path validation** — rejects `../` traversal while allowing `file..txt` (FIX #23)
+- **lstat in directory traversal** — symlinks skipped during compression scan (FIX #24)
 
 ### v4.0 Compression Improvements
 - **4-byte hash function** with golden ratio multiplication for better distribution
@@ -185,14 +187,14 @@ Input --> [4-byte Hash] --> [Fast Chain (8)] --> [Full Chain (128)]
 
 ## Security Model
 
-MiniDeflate implements **21 documented security fixes** for production use:
+MiniDeflate implements **24 documented security fixes** for production use:
 
 | Threat | Mitigation |
 |--------|------------|
 | Path traversal (`../`) | Rejected by `is_safe_path()` with consistent checking |
 | Absolute paths | Blocked (Unix `/`, Windows `C:`) |
-| Symlink attacks | `secure_fopen_write()` uses lstat/reparse point detection |
-| TOCTOU races | File type verified immediately before open |
+| Symlink attacks | `openat(O_NOFOLLOW)` at every path component during extraction |
+| TOCTOU races | Atomic openat on POSIX; best-effort check-then-open on Windows |
 | Zip bombs | 50GB output limit enforced incrementally |
 | Truncated archives | CRC read failure = fatal error (fail-closed) |
 | Buffer overflows | All window/buffer accesses bounds-checked |
@@ -201,7 +203,8 @@ MiniDeflate implements **21 documented security fixes** for production use:
 | Integer overflow | uint64_t counters for all size tracking |
 | Embedded null bytes | Detected and rejected in archive paths |
 | Malformed Huffman | Oversubscription validation on all code tables |
-| TOCTOU symlinks | O_NOFOLLOW atomic rejection (v5.0) |
+| Parent dir symlinks | openat-based extraction rejects symlinks at all levels |
+| Compression symlinks | lstat skips symlinks during folder traversal |
 
 ---
 
@@ -260,7 +263,7 @@ v5.0 includes CRC32 slice-by-4 and buffered I/O for improved throughput on large
 
 | Version | Highlights |
 |---------|------------|
-| **5.0** | 5x limits, CRC32 slice-by-4, buffered I/O, O_NOFOLLOW, Huffman validation |
+| **5.0** | 25GB/50GB limits, CRC32 slice-by-4, openat extraction, 24 security fixes |
 | **4.0** | RFC 1951 distance coding, solid mode, 4-byte hash, adaptive blocks |
 | **3.0** | Folder compression support |
 | **2.0** | Security hardening (18 fixes) |
