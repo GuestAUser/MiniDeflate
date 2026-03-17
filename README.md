@@ -9,7 +9,7 @@
 [![License](https://img.shields.io/badge/license-Proprietary-red.svg)]()
 [![Security](https://img.shields.io/badge/CVEs-0-brightgreen.svg)]()
 
-Single-file implementation (~3100 LOC) with **zero dependencies** beyond the C standard library. Compresses individual files and entire directories with RFC 1951-compliant distance coding.
+Single-file implementation (~3000 LOC) with **zero dependencies** beyond the C standard library. Compresses individual files and entire directories with RFC 1951-compliant distance coding. Security-audited for UB, bounds safety, and adversarial input resilience.
 
 ---
 
@@ -61,7 +61,7 @@ MiniDeflate matches commercial compression tools in:
 - **Reliability** - CRC32 integrity, fail-closed design, zero memory leaks
 - **Usability** - Professional CLI with quiet/verbose modes
 
-All in **~3100 lines of dependency-free C99**.
+All in **~3000 lines of dependency-free C99**.
 
 ---
 
@@ -133,6 +133,12 @@ gcc -O3 -std=c99 -Wall -Wextra -Werror deflate.c -o deflate
 - **Component-wise path validation** — rejects `../` traversal while allowing `file..txt` (FIX #23)
 - **lstat in directory traversal** — symlinks skipped during compression scan (FIX #24)
 
+### Stability Audit
+- **C99 §6.5.7 UB fix** — `1ULL << 64` shift in bitstream writer guarded
+- **Distance coding hardening** — `dist_to_code` underflow and `code_to_dist` overflow protected
+- **Block count limit** — MAX_BLOCKS (4M) prevents CPU bomb via empty-block streams
+- **Dead code removal** — unused variables in `bs_flush` eliminated
+
 ### v4.0 Compression Improvements
 - **4-byte hash function** with golden ratio multiplication for better distribution
 - **RFC 1951 distance coding** (30 codes + extra bits) replacing raw 12-bit distances
@@ -180,6 +186,7 @@ Input --> [4-byte Hash] --> [Fast Chain (8)] --> [Full Chain (128)]
 | CRC32 | Slice-by-4 (4KB tables) |
 | Max Input | 25 GB |
 | Max Output | 50 GB |
+| Max Blocks | 4,000,000 per stream |
 | Max Files | 65,535 per archive |
 | Max Path | 512 bytes |
 
