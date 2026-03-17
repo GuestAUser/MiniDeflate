@@ -2,7 +2,7 @@
 
 Integration tests for MiniDeflate v5.0. The suite builds `deflate.c` from
 source in an isolated temp directory and exercises the resulting binary through
-**24 test cases** organised into five categories.
+**27 test cases** organised into five categories.
 
 ---
 
@@ -52,7 +52,7 @@ Validates every documented flag and error path in `main()`.
 | `A06_missing_paths` | `-c` with one path but no output is rejected |
 | `A07_too_many_args` | Three positional arguments is rejected |
 
-### Category B — Data Integrity Round-Trips (6 tests)
+### Category B — Data Integrity Round-Trips (9 tests)
 
 Compress then decompress, assert bit-exact output. Covers edge-case payloads
 that stress different compressor code paths.
@@ -65,6 +65,9 @@ that stress different compressor code paths.
 | `B04_incompressible` | 64 KB seeded PRNG (seed 42) | Exact match despite slight expansion |
 | `B05_folder_nested` | 4-file tree: `root.txt`, `empty.bin` (0 bytes), `level1/file..txt`, `level1/level2/space name.bin` | Recursive `diff -qr` match. Tests empty files, double-dot in filename, spaces in paths |
 | `B06_solid_mode` | 3 identical 3 KB files | Solid archive smaller than normal archive, `PROS` magic, exact extraction |
+| `B07_empty_file` | 0 bytes | Exact match, output is exactly 0 bytes (validates FIX #25) |
+| `B08_folder_empty_files` | Folder with 0-byte + non-empty files | Non-empty files extracted correctly alongside empty ones |
+| `B09_large_multiblock` | 2 MB seeded PRNG (seed 99) | Exact match, exercises multiple Huffman blocks |
 
 ### Category C — Archive Format Validation (5 tests)
 
@@ -80,14 +83,14 @@ Tests the binary format layer: magic bytes, bad input, truncation.
 
 ### Category D — Security Hardening (4 tests)
 
-Validates the 24 documented security fixes. These are adversarial tests that
+Validates the 27 documented security fixes. These are adversarial tests that
 craft malicious inputs and verify fail-closed behaviour.
 
 | Test | Threat Model | Key Assertion |
 |------|-------------|---------------|
 | `D01_crc_corruption` | Bit-flip in CRC footer of a valid archive | `CRC Mismatch` error, non-zero exit |
 | `D02_path_traversal` | `../` injected into archive file table via binary patching | `Unsafe path in archive` error, escape file does not exist |
-| `D03_intermediate_symlink` | Symlink planted at intermediate directory in extraction tree | Extraction fails, payload not written to symlink target |
+| `D03_intermediate_symlink` | Symlink planted at intermediate directory in extraction tree | `symlink in path` diagnostic, extraction fails, payload not written to symlink target |
 | `D04_output_symlink` | Output path is a symlink to another file | `Output path is a symlink` error, target file not overwritten |
 
 #### Path Traversal Test Details
@@ -162,7 +165,7 @@ and exits non-zero.
 Example:
 
 ```bash
-test_B07_two_byte_roundtrip() {
+test_B10_two_byte_roundtrip() {
     printf 'AB' > "$WORK_DIR/twobyte.bin"
     run_in_workdir 2b_c "$BIN" -c ./twobyte.bin ./twobyte.proz
     assert_exit_ok
@@ -176,17 +179,15 @@ test_B07_two_byte_roundtrip() {
 
 ## Known Limitations
 
-**Empty file decompression**: Compressing a 0-byte file succeeds (produces an
-8-byte archive: 4B magic + 4B CRC, zero blocks). However, decompressing this
-archive fails because the decoder expects at least one Huffman block. The data
-integrity is not affected (output would be 0 bytes), but the exit code is
-non-zero. This is a known edge case in the compressor, not a test bug.
+**Empty directories not preserved**: The archive format stores files, not
+directory entries. Empty directories in the source tree are not recorded and
+will not be recreated on extraction. Directories that contain at least one file
+are created implicitly during extraction.
 
-**Symlink errno variance**: The intermediate symlink test (`D03`) verifies that
-extraction is blocked and no file escapes. On some Linux kernels,
-`openat(O_NOFOLLOW | O_DIRECTORY)` on a symlink returns `ENOTDIR` (errno 20)
-instead of `ELOOP` (errno 40). The security property (extraction blocked) holds
-in both cases; only the diagnostic message text differs.
+**Zero-byte files in folder archives**: When all files in a folder archive are
+0 bytes, only the first file is created on extraction. Zero-byte files mixed
+with non-empty files extract correctly. This is a decompressor file-boundary
+edge case.
 
 ---
 
