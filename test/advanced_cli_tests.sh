@@ -393,6 +393,39 @@ test_B04_incompressible_data_roundtrip() {
     # Incompressible data may expand slightly — that's correct behaviour
 }
 
+test_B07_empty_file_roundtrip() {
+    : > "$WORK_DIR/empty.bin"
+    run_in_workdir empty_c "$BIN" -c ./empty.bin ./empty.proz
+    assert_exit_ok
+    run_in_workdir empty_d "$BIN" -d ./empty.proz ./empty.out
+    assert_exit_ok
+
+    assert_file_eq "$WORK_DIR/empty.bin" "$WORK_DIR/empty.out"
+    assert_file_size "$WORK_DIR/empty.out" 0
+}
+
+test_B08_folder_with_empty_files() {
+    mkdir -p "$WORK_DIR/mixed-empty/sub"
+    : > "$WORK_DIR/mixed-empty/empty.bin"
+    printf 'has-content\n' > "$WORK_DIR/mixed-empty/sub/data.txt"
+    run_in_workdir mixedempty_c "$BIN" -c ./mixed-empty ./mixed-empty.proz
+    assert_exit_ok
+    run_in_workdir mixedempty_d "$BIN" -d ./mixed-empty.proz ./mixed-empty-out
+    assert_exit_ok
+
+    assert_file_eq "$WORK_DIR/mixed-empty/sub/data.txt" "$WORK_DIR/mixed-empty-out/sub/data.txt"
+}
+
+test_B09_large_multiblock() {
+    gen_random_seeded "$WORK_DIR/large.bin" 2097152 99
+    run_in_workdir large_c "$BIN" -c ./large.bin ./large.proz
+    assert_exit_ok
+    run_in_workdir large_d "$BIN" -d ./large.proz ./large.out
+    assert_exit_ok
+
+    assert_file_eq "$WORK_DIR/large.bin" "$WORK_DIR/large.out"
+}
+
 test_B05_folder_roundtrip_nested_paths() {
     gen_folder_fixture "$WORK_DIR/folder-src"
     run_in_workdir folder_c "$BIN" -c ./folder-src ./folder.proz
@@ -508,7 +541,7 @@ test_D03_intermediate_symlink_blocked() {
 
     run_in_workdir sym_d "$BIN" -d ./sym.proz ./sym-out
     assert_exit_fail
-    assert_stderr_contains "Cannot create"
+    assert_stderr_contains "symlink in path"
     assert_not_exists "$WORK_DIR/sym-escape/payload.txt"
 }
 
@@ -607,6 +640,9 @@ main() {
     run_test test_B04_incompressible_data_roundtrip
     run_test test_B05_folder_roundtrip_nested_paths
     run_test test_B06_solid_mode_cross_file_reuse
+    run_test test_B07_empty_file_roundtrip
+    run_test test_B08_folder_with_empty_files
+    run_test test_B09_large_multiblock
 
     # --- Category C: Format validation ---
     printf '\n%s\n' '--- Category C: Archive Format Validation ---'
