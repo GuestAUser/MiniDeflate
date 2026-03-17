@@ -19,7 +19,7 @@
 
 /*
  * ============================================================================
- * SECURITY HARDENING (21 fixes):
+ * SECURITY HARDENING (24 fixes):
  * ----------------------------------------------------------------------------
  * 1. Window bookkeeping: replaced ambiguous 'len' with 'bytes_in_window'
  * 2. Heap API: heap_push() returns bool; callers check for overflow
@@ -59,6 +59,9 @@
  * - Huffman tree oversubscription validation [FIX #21]
  * - Filelist capacity overflow protection
  * - memset-based hash chain reset (replaces 32K-iteration loops)
+ * - openat-based extraction rejects symlinks at all path levels [FIX #22]
+ * - Component-wise ".." validation (allows "file..txt") [FIX #23]
+ * - lstat() in traverse_directory prevents symlink following [FIX #24]
  * ============================================================================
  */
 
@@ -405,6 +408,80 @@ static FILE* secure_fopen_write(const char *path, bool *is_symlink) {
 #endif
 }
 
+/*
+ * FIX #22: openat-based secure extraction — rejects symlinks at ANY path level.
+ * On POSIX, walks each component of rel_path under out_dir using openat(O_NOFOLLOW)
+ * and creates intermediate directories with mkdirat(). A planted symlink at ANY
+ * level (not just the leaf) triggers ELOOP and immediate rejection.
+ * On Windows, falls back to best-effort reparse point checks (TOCTOU remains).
+ */
+#if PLATFORM_WINDOWS
+static FILE* secure_extract_open(const char *out_dir, const char *rel_path, bool *is_symlink) {
+    *is_symlink = false;
+    char full_path[MAX_PATH_LEN * 2];
+    snprintf(full_path, sizeof(full_path), "%s/%s", out_dir, rel_path);
+    normalize_path(full_path);
+
+    char *last_slash = strrchr(full_path, '/');
+    if (last_slash) {
+        *last_slash = '\0';
+        create_directory_recursive(full_path);
+        *last_slash = '/';
+    }
+    return secure_fopen_write(full_path, is_symlink);
+}
+#else
+static FILE* secure_extract_open(const char *out_dir, const char *rel_path, bool *is_symlink) {
+    *is_symlink = false;
+
+    int dir_fd = open(out_dir, O_RDONLY | O_DIRECTORY);
+    if (dir_fd < 0) return NULL;
+
+    char path_copy[MAX_PATH_LEN];
+    strncpy(path_copy, rel_path, MAX_PATH_LEN - 1);
+    path_copy[MAX_PATH_LEN - 1] = '\0';
+    for (char *p = path_copy; *p; p++) {
+        if (*p == '\\') *p = '/';
+    }
+
+    char *start = path_copy;
+    char *slash;
+    while ((slash = strchr(start, '/')) != NULL) {
+        *slash = '\0';
+        if (start[0] != '\0') {
+            (void)mkdirat(dir_fd, start, 0755);
+            int new_fd = openat(dir_fd, start, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+            close(dir_fd);
+            if (new_fd < 0) {
+                if (errno == ELOOP) *is_symlink = true;
+                return NULL;
+            }
+            dir_fd = new_fd;
+        }
+        start = slash + 1;
+    }
+
+    if (start[0] == '\0') {
+        close(dir_fd);
+        return NULL;
+    }
+
+    int file_fd = openat(dir_fd, start, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0644);
+    close(dir_fd);
+    if (file_fd < 0) {
+        if (errno == ELOOP) *is_symlink = true;
+        return NULL;
+    }
+
+    FILE *fp = fdopen(file_fd, "wb");
+    if (!fp) {
+        close(file_fd);
+        return NULL;
+    }
+    return fp;
+}
+#endif
+
 /**
  * Check if path is a directory.
  */
@@ -617,7 +694,12 @@ static bool traverse_directory(const char *base_path, const char *rel_path, File
         /* Build full path */
         snprintf(full_path, sizeof(full_path), "%s/%s", base_path, new_rel);
 
-        if (stat(full_path, &st) != 0) {
+        if (lstat(full_path, &st) != 0) {
+            continue;
+        }
+
+        /* FIX #24: Skip symlinks — never follow into external trees */
+        if (S_ISLNK(st.st_mode)) {
             continue;
         }
 
@@ -1511,13 +1593,20 @@ static bool is_safe_path(const char *path) {
         check += 2;
     }
 
-    /* FIX #12: Reject parent directory traversal - use 'check' not 'path' */
-    if (strstr(check, "..") != NULL) return false;
+    /* FIX #23: Component-wise validation (rejects ".." components, allows "file..txt") */
+    const char *p = check;
+    while (*p) {
+        const char *end = p;
+        while (*end && *end != '/' && *end != '\\') end++;
+        size_t comp_len = (size_t)(end - p);
 
-    /* Reject dangerous characters (including ':' for non-drive contexts) */
-    for (const char *p = check; *p; p++) {
-        if (*p < 32 || *p == '<' || *p == '>' || *p == '|' || *p == '"' || *p == ':')
-            return false;
+        if (comp_len == 2 && p[0] == '.' && p[1] == '.') return false;
+
+        for (const char *c = p; c < end; c++) {
+            if (*c < 32 || *c == '<' || *c == '>' || *c == '|' || *c == '"' || *c == ':')
+                return false;
+        }
+        p = *end ? end + 1 : end;
     }
 
     return strlen(path) < MAX_PATH_LEN;
@@ -2485,24 +2574,14 @@ static DeflateError decompress_folder(const char *infile, const char *out_dir, b
 
     uint32_t current_file = 0;
     uint64_t current_file_written = 0;
-    char out_path[MAX_PATH_LEN * 2];
 
     if (file_count > 0) {
-        snprintf(out_path, sizeof(out_path), "%s/%s", out_dir, fl->entries[0].path);
-        normalize_path(out_path);
-
-        char *last_slash = strrchr(out_path, '/');
-        if (last_slash) {
-            *last_slash = '\0';
-            create_directory_recursive(out_path);
-            *last_slash = '/';
-        }
-
         bool is_symlink = false;
-        out = secure_fopen_write(out_path, &is_symlink);
+        out = secure_extract_open(out_dir, fl->entries[0].path, &is_symlink);
         if (!out) {
-            LOG_ERR("Error: Cannot create file '%s'\n", out_path);
-            result = DEFLATE_ERR_IO;
+            LOG_ERR("Error: Cannot create '%s'%s\n", fl->entries[0].path,
+                    is_symlink ? " (symlink in path)" : "");
+            result = is_symlink ? DEFLATE_ERR_PATH : DEFLATE_ERR_IO;
             goto folder_decompress_cleanup;
         }
         wbuf_init(&wb, out);
@@ -2601,21 +2680,12 @@ static DeflateError decompress_folder(const char *infile, const char *out_dir, b
                     current_file_written = 0;
 
                     if (current_file < file_count) {
-                        snprintf(out_path, sizeof(out_path), "%s/%s", out_dir, fl->entries[current_file].path);
-                        normalize_path(out_path);
-
-                        char *last_slash = strrchr(out_path, '/');
-                        if (last_slash) {
-                            *last_slash = '\0';
-                            create_directory_recursive(out_path);
-                            *last_slash = '/';
-                        }
-
                         bool is_symlink = false;
-                        out = secure_fopen_write(out_path, &is_symlink);
+                        out = secure_extract_open(out_dir, fl->entries[current_file].path, &is_symlink);
                         if (!out) {
-                            LOG_ERR("Error: Cannot create file '%s'\n", out_path);
-                            result = DEFLATE_ERR_IO;
+                            LOG_ERR("Error: Cannot create '%s'%s\n", fl->entries[current_file].path,
+                                    is_symlink ? " (symlink in path)" : "");
+                            result = is_symlink ? DEFLATE_ERR_PATH : DEFLATE_ERR_IO;
                             goto folder_decompress_cleanup;
                         }
                         wbuf_init(&wb, out);
@@ -2689,20 +2759,10 @@ static DeflateError decompress_folder(const char *infile, const char *out_dir, b
                         current_file_written = 0;
 
                         if (current_file < file_count) {
-                            snprintf(out_path, sizeof(out_path), "%s/%s", out_dir, fl->entries[current_file].path);
-                            normalize_path(out_path);
-
-                            char *last_slash = strrchr(out_path, '/');
-                            if (last_slash) {
-                                *last_slash = '\0';
-                                create_directory_recursive(out_path);
-                                *last_slash = '/';
-                            }
-
                             bool is_symlink = false;
-                            out = secure_fopen_write(out_path, &is_symlink);
+                            out = secure_extract_open(out_dir, fl->entries[current_file].path, &is_symlink);
                             if (!out) {
-                                result = DEFLATE_ERR_IO;
+                                result = is_symlink ? DEFLATE_ERR_PATH : DEFLATE_ERR_IO;
                                 goto folder_decompress_cleanup;
                             }
                             wbuf_init(&wb, out);
