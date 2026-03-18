@@ -104,10 +104,8 @@
 /* v5.0: Lock-free stdio on POSIX — avoids per-byte mutex overhead */
 #if !PLATFORM_WINDOWS && defined(_POSIX_C_SOURCE) && (_POSIX_C_SOURCE >= 1)
 #define FAST_GETC(fp) getc_unlocked(fp)
-#define FAST_PUTC(c, fp) putc_unlocked((c), (fp))
 #else
 #define FAST_GETC(fp) fgetc(fp)
-#define FAST_PUTC(c, fp) fputc((c), (fp))
 #endif
 
 /* ==================== CONFIGURATION ==================== */
@@ -2092,12 +2090,11 @@ static DeflateError compress_folder(const char *folder_path, const char *outfile
         goto folder_compress_cleanup;
     }
 
-    /* FIX #26: Account for file table size in bytes_out */
-    uint64_t file_table_bytes = 0;
-    for (uint32_t i = 0; i < fl->count; i++) {
-        file_table_bytes += 2 + strlen(fl->entries[i].path) + 8;
+    uint64_t file_table_size = 0;
+    for (uint32_t fi = 0; fi < fl->count; fi++) {
+        file_table_size += 2 + strlen(fl->entries[fi].path) + 8;
     }
-    ctx->bytes_out = 8 + file_table_bytes + bs.bytes_written + 4;
+    ctx->bytes_out = 4 + 4 + file_table_size + bs.bytes_written + 4;
 
     LOG_NORMAL_MSG("\nFolder Compression Complete%s\n", g_solid_mode ? " (solid)" : "");
     LOG_NORMAL_MSG("Files:  %u\n", fl->count);
