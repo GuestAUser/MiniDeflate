@@ -3,7 +3,7 @@
 # MiniDeflate v5.0 — Advanced Integration Test Suite
 #
 # Builds deflate.c in a disposable temp directory and exercises the binary
-# through 28 test cases covering:
+# through 32 test cases covering:
 #
 #   Category A  — CLI argument parsing and flags
 #   Category B  — Data integrity round-trips (edge-case payloads)
@@ -296,6 +296,33 @@ p.write_bytes(d)
 PY
 }
 
+patch_archive_file_size() {
+    python3 - "$1" "$2" "$3" <<'PY'
+import sys
+from pathlib import Path
+
+p = Path(sys.argv[1])
+target_path = sys.argv[2]
+new_size = int(sys.argv[3])
+d = bytearray(p.read_bytes())
+file_count = int.from_bytes(d[4:8], "little")
+off = 8
+
+for _ in range(file_count):
+    path_len = int.from_bytes(d[off:off + 2], "little")
+    off += 2
+    entry_path = d[off:off + path_len].decode("utf-8")
+    off += path_len
+    if entry_path == target_path:
+        d[off:off + 8] = new_size.to_bytes(8, "little")
+        p.write_bytes(d)
+        raise SystemExit(0)
+    off += 8
+
+raise SystemExit(f"archive entry not found: {target_path}")
+PY
+}
+
 # ========================= CATEGORY A: CLI FLAGS ===========================
 
 test_A01_version_flag() {
@@ -443,6 +470,28 @@ test_B10_folder_all_empty_files() {
     assert_file_size "$WORK_DIR/all-empty-out/sub/c.bin" 0
 }
 
+test_B11_absolute_file_paths_roundtrip() {
+    printf 'absolute-path-roundtrip\n' > "$WORK_DIR/abs.txt"
+
+    run_raw abs_c "$BIN" -c "$WORK_DIR/abs.txt" "$WORK_DIR/abs.proz"
+    assert_exit_ok
+    run_raw abs_d "$BIN" -d "$WORK_DIR/abs.proz" "$WORK_DIR/abs.out"
+    assert_exit_ok
+
+    assert_file_eq "$WORK_DIR/abs.txt" "$WORK_DIR/abs.out"
+}
+
+test_B12_absolute_folder_paths_roundtrip() {
+    gen_folder_fixture "$WORK_DIR/abs-folder-src"
+
+    run_raw absfolder_c "$BIN" -c "$WORK_DIR/abs-folder-src" "$WORK_DIR/abs-folder.proz"
+    assert_exit_ok
+    run_raw absfolder_d "$BIN" -d "$WORK_DIR/abs-folder.proz" "$WORK_DIR/abs-folder-out"
+    assert_exit_ok
+
+    assert_dir_eq "$WORK_DIR/abs-folder-src" "$WORK_DIR/abs-folder-out"
+}
+
 test_B05_folder_roundtrip_nested_paths() {
     gen_folder_fixture "$WORK_DIR/folder-src"
     run_in_workdir folder_c "$BIN" -c ./folder-src ./folder.proz
@@ -513,6 +562,41 @@ test_C05_nonexistent_input_rejected() {
     run_in_workdir nofile_d "$BIN" -d ./does_not_exist.proz ./out.bin
     assert_exit_fail
     assert_stderr_contains "Error opening input"
+}
+
+test_C06_folder_declared_size_too_large_rejected() {
+    mkdir -p "$WORK_DIR/sizeplus-src"
+    python3 - "$WORK_DIR/sizeplus-src/payload.txt" <<'PY'
+import sys
+from pathlib import Path
+
+Path(sys.argv[1]).write_bytes(bytes((i * 17 + 3) & 0xFF for i in range(65536)))
+PY
+
+    run_in_workdir sizeplus_c "$BIN" -c ./sizeplus-src ./sizeplus.proz
+    assert_exit_ok
+
+    patch_archive_file_size "$WORK_DIR/sizeplus.proz" "payload.txt" 65540
+
+    run_in_workdir sizeplus_d "$BIN" -d ./sizeplus.proz ./sizeplus-out
+    assert_exit_fail
+    assert_stderr_contains "Folder payload size mismatch"
+    assert_file_eq "$WORK_DIR/sizeplus-src/payload.txt" "$WORK_DIR/sizeplus-out/payload.txt"
+}
+
+test_C07_folder_declared_size_too_small_rejected() {
+    mkdir -p "$WORK_DIR/sizeminus-src"
+    printf 'payload-data\n' > "$WORK_DIR/sizeminus-src/payload.txt"
+
+    run_in_workdir sizeminus_c "$BIN" -c ./sizeminus-src ./sizeminus.proz
+    assert_exit_ok
+
+    patch_archive_file_size "$WORK_DIR/sizeminus.proz" "payload.txt" 4
+
+    run_in_workdir sizeminus_d "$BIN" -d ./sizeminus.proz ./sizeminus-out
+    assert_exit_fail
+    assert_stderr_contains "declared file sizes"
+    assert_file_size "$WORK_DIR/sizeminus-out/payload.txt" 4
 }
 
 # ========================= CATEGORY D: SECURITY ============================
@@ -661,6 +745,8 @@ main() {
     run_test test_B08_folder_with_empty_files
     run_test test_B09_large_multiblock
     run_test test_B10_folder_all_empty_files
+    run_test test_B11_absolute_file_paths_roundtrip
+    run_test test_B12_absolute_folder_paths_roundtrip
 
     # --- Category C: Format validation ---
     printf '\n%s\n' '--- Category C: Archive Format Validation ---'
@@ -669,6 +755,8 @@ main() {
     run_test test_C03_bad_magic_rejected
     run_test test_C04_truncated_archive_rejected
     run_test test_C05_nonexistent_input_rejected
+    run_test test_C06_folder_declared_size_too_large_rejected
+    run_test test_C07_folder_declared_size_too_small_rejected
 
     # --- Category D: Security ---
     printf '\n%s\n' '--- Category D: Security Hardening ---'

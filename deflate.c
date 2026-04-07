@@ -28,11 +28,11 @@
  * 5. Bounds safety: hash4() guarded for MIN_MATCH bytes; window access clamped
  * 6. bs_read_bits: all callers pass non-NULL error pointer
  * 7. File size: replaced ftell(long) with uint64_t counter; portable checks
- * 8. is_safe_path: allows "./" prefix while rejecting ".."
+ * 8. is_safe_archive_path: allows "./" prefix while rejecting ".."
  * 9. DEBUG asserts: compile-time diagnostics under #ifdef DEBUG
  * 10. Huffman cleanup: free_tree called on all error paths; no leaks
  * 11. CRC footer: fail-closed on truncated files; incomplete CRC is fatal
- * 12. is_safe_path: use 'check' consistently; reject ':' in path components
+ * 12. is_safe_archive_path: use 'check' consistently; reject ':' in path components
  * 13. bs_write: mode_write assertion to catch misuse in debug builds
  * 14. bytes_out: accurate tracking via BitStream counter
  * 15. heap_destroy: frees remaining HuffmanNode pointers (no leak on error)
@@ -577,6 +577,17 @@ static void normalize_path(char *path) {
     for (char *p = path; *p; p++) {
         if (*p == '\\') *p = '/';
     }
+}
+
+static DeflateError join_path_checked(char *dst, size_t dst_size,
+                                      const char *base, const char *rel) {
+    int written = snprintf(dst, dst_size, "%s/%s", base, rel);
+    if (written < 0 || (size_t)written >= dst_size) {
+        LOG_ERR("Error: Path too long\n");
+        return DEFLATE_ERR_PATH;
+    }
+    normalize_path(dst);
+    return DEFLATE_OK;
 }
 
 /* Create directory (and parents if needed) */
@@ -1478,7 +1489,17 @@ static bool validate_huffman_lengths(const int32_t *bl_count, int32_t max_bits) 
  * FIX #8: Allows "./" prefix (current directory) but rejects "..".
  * FIX #12: Use 'check' consistently after skipping "./" prefix.
  */
-static bool is_safe_path(const char *path) {
+static bool is_valid_host_path(const char *path) {
+    if (!path || !path[0]) return false;
+
+    for (const unsigned char *p = (const unsigned char *)path; *p; p++) {
+        if (*p < 32) return false;
+    }
+
+    return true;
+}
+
+static bool is_safe_archive_path(const char *path) {
     if (!path || !path[0]) return false;
 
     /* Reject absolute paths */
@@ -1591,7 +1612,7 @@ static DeflateError compress_file(const char *infile, const char *outfile) {
     DeflateContext *ctx = NULL;
     DeflateError result = DEFLATE_OK;
 
-    if (!is_safe_path(infile) || !is_safe_path(outfile)) {
+    if (!is_valid_host_path(infile) || !is_valid_host_path(outfile)) {
         LOG_ERR("Error: Invalid file path\n");
         return DEFLATE_ERR_PATH;
     }
@@ -1812,7 +1833,7 @@ static DeflateError compress_folder(const char *folder_path, const char *outfile
     FileList *fl = NULL;
     DeflateError result = DEFLATE_OK;
 
-    if (!is_safe_path(outfile)) {
+    if (!is_valid_host_path(folder_path) || !is_valid_host_path(outfile)) {
         LOG_ERR("Error: Invalid output path\n");
         return DEFLATE_ERR_PATH;
     }
@@ -1906,8 +1927,9 @@ static DeflateError compress_folder(const char *folder_path, const char *outfile
     while (current_file < fl->count || bytes_in_window > 0) {
         /* Open next file if needed */
         if (!in && current_file < fl->count) {
-            snprintf(full_path, sizeof(full_path), "%s/%s", folder_path, fl->entries[current_file].path);
-            normalize_path(full_path);
+            result = join_path_checked(full_path, sizeof(full_path), folder_path,
+                                       fl->entries[current_file].path);
+            if (result != DEFLATE_OK) goto folder_compress_cleanup;
 
             in = secure_fopen_read(full_path);
             if (!in) {
@@ -1949,8 +1971,9 @@ static DeflateError compress_folder(const char *folder_path, const char *outfile
 
                 /* Open next file */
                 if (current_file < fl->count) {
-                    snprintf(full_path, sizeof(full_path), "%s/%s", folder_path, fl->entries[current_file].path);
-                    normalize_path(full_path);
+                    result = join_path_checked(full_path, sizeof(full_path), folder_path,
+                                               fl->entries[current_file].path);
+                    if (result != DEFLATE_OK) goto folder_compress_cleanup;
 
                     in = secure_fopen_read(full_path);
                     if (!in) {
@@ -2030,8 +2053,9 @@ static DeflateError compress_folder(const char *folder_path, const char *outfile
 
                     /* Open next file */
                     if (current_file < fl->count) {
-                        snprintf(full_path, sizeof(full_path), "%s/%s", folder_path, fl->entries[current_file].path);
-                        normalize_path(full_path);
+                        result = join_path_checked(full_path, sizeof(full_path), folder_path,
+                                                   fl->entries[current_file].path);
+                        if (result != DEFLATE_OK) goto folder_compress_cleanup;
                         in = secure_fopen_read(full_path);
                         if (in) {
                             current_file_remaining = fl->entries[current_file].size;
@@ -2137,7 +2161,7 @@ static DeflateError decompress_file(const char *infile, const char *outfile) {
     DeflateContext *ctx = NULL;
     DeflateError result = DEFLATE_OK;
 
-    if (!is_safe_path(infile) || !is_safe_path(outfile)) {
+    if (!is_valid_host_path(infile) || !is_valid_host_path(outfile)) {
         LOG_ERR("Error: Invalid file path\n");
         return DEFLATE_ERR_PATH;
     }
@@ -2399,6 +2423,78 @@ decompress_cleanup:
 
 /* ==================== FOLDER DECOMPRESSION ==================== */
 
+static DeflateError folder_advance_output_file(FILE **out, WriteBuf *wb,
+                                               const char *out_dir, const FileList *fl,
+                                               uint32_t *current_file,
+                                               uint64_t *current_file_written) {
+    while (*current_file < fl->count &&
+           *current_file_written >= fl->entries[*current_file].size) {
+        if (*out) {
+            if (!wbuf_flush(wb)) {
+                LOG_ERR("Error: Write failed during decompression\n");
+                return DEFLATE_ERR_IO;
+            }
+            fclose(*out);
+            *out = NULL;
+        }
+
+        (*current_file)++;
+        *current_file_written = 0;
+
+        if (*current_file < fl->count) {
+            bool is_symlink = false;
+            *out = secure_extract_open(out_dir, fl->entries[*current_file].path, &is_symlink);
+            if (!*out) {
+                LOG_ERR("Error: Cannot create '%s'%s\n", fl->entries[*current_file].path,
+                        is_symlink ? " (symlink in path)" : "");
+                return is_symlink ? DEFLATE_ERR_PATH : DEFLATE_ERR_IO;
+            }
+            wbuf_init(wb, *out);
+            LOG_VERBOSE_MSG("  Extracting: %s\n", fl->entries[*current_file].path);
+        }
+    }
+
+    return DEFLATE_OK;
+}
+
+static DeflateError folder_emit_decoded_byte(DeflateContext *ctx, FILE **out, WriteBuf *wb,
+                                             const char *out_dir, const FileList *fl,
+                                             uint32_t *current_file,
+                                             uint64_t *current_file_written,
+                                             uint16_t *window_pos, uint32_t *calc_crc,
+                                             uint64_t *total_output,
+                                             uint64_t expected_total, uint8_t byte) {
+    DeflateError result = folder_advance_output_file(out, wb, out_dir, fl,
+                                                     current_file, current_file_written);
+    if (result != DEFLATE_OK) return result;
+
+    if (*current_file >= fl->count || *total_output >= expected_total) {
+        LOG_ERR("Error: Archive contains decoded data beyond declared file sizes\n");
+        return DEFLATE_ERR_CORRUPT;
+    }
+
+    if (*out) {
+        wbuf_put(wb, byte);
+        if (wb->error) {
+            LOG_ERR("Error: Write failed during decompression\n");
+            return DEFLATE_ERR_IO;
+        }
+        (*current_file_written)++;
+    }
+
+    *calc_crc = update_crc32(&ctx->crc_tables, *calc_crc, &byte, 1);
+    ctx->decomp_window[*window_pos] = byte;
+    *window_pos = (uint16_t)((*window_pos + 1) & WINDOW_MASK);
+    (*total_output)++;
+
+    if (*total_output > MAX_OUTPUT_SIZE) {
+        LOG_ERR("Error: Output limit exceeded\n");
+        return DEFLATE_ERR_LIMIT;
+    }
+
+    return DEFLATE_OK;
+}
+
 /**
  * Decompress a folder archive into a directory.
  * Supports both solid and non-solid modes (detected from magic).
@@ -2410,8 +2506,8 @@ static DeflateError decompress_folder(const char *infile, const char *out_dir, b
     FileList *fl = NULL;
     DeflateError result = DEFLATE_OK;
 
-    if (!out_dir || !out_dir[0]) {
-        LOG_ERR("Error: Invalid output directory\n");
+    if (!is_valid_host_path(infile) || !is_valid_host_path(out_dir)) {
+        LOG_ERR("Error: Invalid path\n");
         return DEFLATE_ERR_PATH;
     }
 
@@ -2446,6 +2542,7 @@ static DeflateError decompress_folder(const char *infile, const char *out_dir, b
         return DEFLATE_ERR_MEM;
     }
 
+    uint64_t expected_total = 0;
     for (uint32_t i = 0; i < file_count; i++) {
         uint16_t path_len;
         char path[MAX_PATH_LEN];
@@ -2477,11 +2574,19 @@ static DeflateError decompress_folder(const char *infile, const char *out_dir, b
             goto folder_decompress_cleanup;
         }
 
-        if (!is_safe_path(path)) {
+        if (!is_safe_archive_path(path)) {
             LOG_ERR("Error: Unsafe path in archive: %s\n", path);
             result = DEFLATE_ERR_PATH;
             goto folder_decompress_cleanup;
         }
+
+        if (size > MAX_OUTPUT_SIZE || expected_total > MAX_OUTPUT_SIZE - size) {
+            LOG_ERR("Error: Declared output exceeds %llu byte limit\n",
+                    (unsigned long long)MAX_OUTPUT_SIZE);
+            result = DEFLATE_ERR_LIMIT;
+            goto folder_decompress_cleanup;
+        }
+        expected_total += size;
 
         if (!filelist_add(fl, path, size)) {
             LOG_ERR("Error: Too many files in archive\n");
@@ -2622,49 +2727,13 @@ static DeflateError decompress_folder(const char *infile, const char *out_dir, b
             if (sym == 256) break;  /* EOB */
 
             if (sym < 257) {
-                /* Literal byte */
                 uint8_t b = (uint8_t)sym;
-
-                while (current_file < file_count &&
-                       current_file_written >= fl->entries[current_file].size) {
-                    if (out) {
-                        wbuf_flush(&wb);
-                        fclose(out);
-                        out = NULL;
-                    }
-                    current_file++;
-                    current_file_written = 0;
-
-                    if (current_file < file_count) {
-                        bool is_symlink = false;
-                        out = secure_extract_open(out_dir, fl->entries[current_file].path, &is_symlink);
-                        if (!out) {
-                            LOG_ERR("Error: Cannot create '%s'%s\n", fl->entries[current_file].path,
-                                    is_symlink ? " (symlink in path)" : "");
-                            result = is_symlink ? DEFLATE_ERR_PATH : DEFLATE_ERR_IO;
-                            goto folder_decompress_cleanup;
-                        }
-                        wbuf_init(&wb, out);
-                        LOG_VERBOSE_MSG("  Extracting: %s\n", fl->entries[current_file].path);
-                    }
-                }
-
-                if (out) {
-                    wbuf_put(&wb, b);
-                    current_file_written++;
-                }
-
-                calc_crc = update_crc32(&ctx->crc_tables, calc_crc, &b, 1);
-                ctx->decomp_window[window_pos] = b;
-                window_pos = (window_pos + 1) & WINDOW_MASK;
-                total_output++;
-
-                if (total_output > MAX_OUTPUT_SIZE) {
-                    result = DEFLATE_ERR_LIMIT;
-                    goto folder_decompress_cleanup;
-                }
+                result = folder_emit_decoded_byte(ctx, &out, &wb, out_dir, fl,
+                                                  &current_file, &current_file_written,
+                                                  &window_pos, &calc_crc, &total_output,
+                                                  expected_total, b);
+                if (result != DEFLATE_OK) goto folder_decompress_cleanup;
             } else {
-                /* Length-distance pair with RFC 1951 distance coding */
                 int32_t len = (sym - 257) + 3;
 
                 bool dist_code_err = false;
@@ -2700,72 +2769,44 @@ static DeflateError decompress_folder(const char *infile, const char *out_dir, b
                     goto folder_decompress_cleanup;
                 }
 
+                if (total_output > expected_total || (uint64_t)len > expected_total - total_output) {
+                    LOG_ERR("Error: Match exceeds declared folder size\n");
+                    result = DEFLATE_ERR_CORRUPT;
+                    goto folder_decompress_cleanup;
+                }
+
                 uint16_t src = (window_pos - (uint16_t)dist) & WINDOW_MASK;
                 for (int32_t i = 0; i < len; i++) {
                     uint8_t c = ctx->decomp_window[(src + i) & WINDOW_MASK];
 
-                    while (current_file < file_count &&
-                           current_file_written >= fl->entries[current_file].size) {
-                        if (out) {
-                            wbuf_flush(&wb);
-                            fclose(out);
-                            out = NULL;
-                        }
-                        current_file++;
-                        current_file_written = 0;
-
-                        if (current_file < file_count) {
-                            bool is_symlink = false;
-                            out = secure_extract_open(out_dir, fl->entries[current_file].path, &is_symlink);
-                            if (!out) {
-                                result = is_symlink ? DEFLATE_ERR_PATH : DEFLATE_ERR_IO;
-                                goto folder_decompress_cleanup;
-                            }
-                            wbuf_init(&wb, out);
-                            LOG_VERBOSE_MSG("  Extracting: %s\n", fl->entries[current_file].path);
-                        }
-                    }
-
-                    if (out) {
-                        wbuf_put(&wb, c);
-                        current_file_written++;
-                    }
-
-                    calc_crc = update_crc32(&ctx->crc_tables, calc_crc, &c, 1);
-                    ctx->decomp_window[window_pos] = c;
-                    window_pos = (window_pos + 1) & WINDOW_MASK;
-                    total_output++;
+                    result = folder_emit_decoded_byte(ctx, &out, &wb, out_dir, fl,
+                                                      &current_file, &current_file_written,
+                                                      &window_pos, &calc_crc, &total_output,
+                                                      expected_total, c);
+                    if (result != DEFLATE_OK) goto folder_decompress_cleanup;
                 }
             }
         }
     }
 
-    if (out && !wbuf_flush(&wb)) {
-        LOG_ERR("Error: Write failed during decompression\n");
-        result = DEFLATE_ERR_IO;
+    result = folder_advance_output_file(&out, &wb, out_dir, fl,
+                                        &current_file, &current_file_written);
+    if (result != DEFLATE_OK) goto folder_decompress_cleanup;
+
+    if (total_output != expected_total) {
+        LOG_ERR("Error: Folder payload size mismatch (expected %llu, got %llu)\n",
+                (unsigned long long)expected_total,
+                (unsigned long long)total_output);
+        result = DEFLATE_ERR_CORRUPT;
         goto folder_decompress_cleanup;
     }
 
-    /* Create any remaining files that received zero bytes (empty trailing files) */
-    while (current_file < file_count &&
-           current_file_written >= fl->entries[current_file].size) {
-        if (out) { wbuf_flush(&wb); fclose(out); out = NULL; }
-        current_file++;
-        current_file_written = 0;
-        if (current_file < file_count) {
-            bool is_symlink = false;
-            out = secure_extract_open(out_dir, fl->entries[current_file].path, &is_symlink);
-            if (!out) {
-                LOG_ERR("Error: Cannot create '%s'%s\n", fl->entries[current_file].path,
-                        is_symlink ? " (symlink in path)" : "");
-                result = is_symlink ? DEFLATE_ERR_PATH : DEFLATE_ERR_IO;
-                goto folder_decompress_cleanup;
-            }
-            wbuf_init(&wb, out);
-            LOG_VERBOSE_MSG("  Extracting: %s\n", fl->entries[current_file].path);
-        }
-    }
-    if (out) { wbuf_flush(&wb); fclose(out); out = NULL; }
+    LOG_VERBOSE_MSG("Footer state: total=%llu expected=%llu current_file=%u current_file_written=%llu bit_count=%d pos=%zu bytes_in_buf=%zu\n",
+                    (unsigned long long)total_output,
+                    (unsigned long long)expected_total,
+                    current_file,
+                    (unsigned long long)current_file_written,
+                    bs.bit_count, bs.pos, bs.bytes_in_buf);
 
     uint32_t file_crc;
     if (!bs_read_aligned_uint32(&bs, &file_crc)) {
