@@ -2,7 +2,7 @@
 
 Integration tests for MiniDeflate v5.0. The suite builds `deflate.c` from
 source in an isolated temp directory and exercises the resulting binary through
-**28 test cases** organised into five categories.
+**32 test cases** organised into five categories.
 
 ---
 
@@ -52,7 +52,7 @@ Validates every documented flag and error path in `main()`.
 | `A06_missing_paths` | `-c` with one path but no output is rejected |
 | `A07_too_many_args` | Three positional arguments is rejected |
 
-### Category B — Data Integrity Round-Trips (10 tests)
+### Category B — Data Integrity Round-Trips (12 tests)
 
 Compress then decompress, assert bit-exact output. Covers edge-case payloads
 that stress different compressor code paths.
@@ -69,8 +69,10 @@ that stress different compressor code paths.
 | `B08_folder_empty_files` | Folder with 0-byte + non-empty files | Non-empty files extracted correctly alongside empty ones |
 | `B09_large_multiblock` | 2 MB seeded PRNG (seed 99) | Exact match, exercises multiple Huffman blocks |
 | `B10_folder_all_empty_files` | Folder with only 0-byte files, including nested paths | Recursive `diff -qr` match. Verifies every empty file is recreated |
+| `B11_absolute_file_paths` | Absolute host paths for input, archive, and output | Exact round-trip using non-relative CLI arguments |
+| `B12_absolute_folder_paths` | Absolute host paths for folder input, archive, and output directory | Recursive `diff -qr` match for folder mode |
 
-### Category C — Archive Format Validation (5 tests)
+### Category C — Archive Format Validation (7 tests)
 
 Tests the binary format layer: magic bytes, bad input, truncation.
 
@@ -81,6 +83,8 @@ Tests the binary format layer: magic bytes, bad input, truncation.
 | `C03_bad_magic` | Decompressing a non-archive file → `Unknown archive format` error |
 | `C04_truncated_archive` | Archive cut to 10 bytes → decompression error (no crash) |
 | `C05_nonexistent_input` | Missing input file → `Error opening input` on both `-c` and `-d` |
+| `C06_folder_size_too_large` | Folder archive with declared file size larger than encoded payload | Rejects with folder payload size mismatch before footer acceptance |
+| `C07_folder_size_too_small` | Folder archive with declared file size smaller than encoded payload | Rejects trailing decoded payload beyond declared file sizes |
 
 ### Category D — Security Hardening (4 tests)
 
@@ -103,7 +107,7 @@ PROF archive layout:
   [4B Magic][4B FileCount][2B PathLen][PathLen bytes Path][8B Size]...
 
 The test creates a 1-file archive with filename "plainabc" (8 chars),
-then patches bytes 10..17 to "../ab.cd" (also 8 chars). is_safe_path()
+then patches bytes 10..17 to "../ab.cd" (also 8 chars). is_safe_archive_path()
 rejects the ".." component.
 ```
 
@@ -155,9 +159,8 @@ and exits non-zero.
 1. Write a function named `test_X##_description` where `X` is the category
    letter and `##` is the next sequential number.
 
-2. Use `run_in_workdir <label> "$BIN" ...` to invoke the compressor. All paths
-   passed to the binary must be **relative** (`./foo`) because `is_safe_path()`
-   rejects absolute paths.
+2. Use `run_in_workdir <label> "$BIN" ...` for relative-path tests or `run_raw`
+   when you want to exercise absolute host filesystem paths.
 
 3. Follow the run with assertions.
 

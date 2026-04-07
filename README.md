@@ -9,7 +9,7 @@
 [![License](https://img.shields.io/badge/license-Proprietary-red.svg)]()
 [![Security](https://img.shields.io/badge/CVEs-0-brightgreen.svg)]()
 
-Single-file implementation (~2900 LOC) with **zero dependencies** beyond the C standard library. Compresses individual files and entire directories with RFC 1951-compliant distance coding. Security-audited for UB, bounds safety, and adversarial input resilience. Ships with a **28-test integration suite**.
+Single-file implementation (~2900 LOC) with **zero dependencies** beyond the C standard library. Compresses individual files and entire directories with RFC 1951-compliant distance coding. Security-audited for UB, bounds safety, and adversarial input resilience. Ships with a **32-test integration suite**.
 
 ---
 
@@ -268,7 +268,7 @@ v5.0 includes CRC32 slice-by-4 and buffered I/O for improved throughput on large
 bash test/advanced_cli_tests.sh
 ```
 
-28 integration tests across 5 categories: CLI parsing, data round-trips (empty file through all-empty folder archives and 2MB multiblock), format validation, security hardening (CRC tampering, path traversal, symlink injection), and output modes. See [`test/README.md`](test/README.md) for details.
+32 integration tests across 5 categories: CLI parsing, data round-trips (including absolute-path file/folder runs), format validation (including declared-size corruption cases), security hardening (CRC tampering, path traversal, symlink injection), and output modes. See [`test/README.md`](test/README.md) for details.
 
 ---
 
