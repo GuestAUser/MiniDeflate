@@ -3,7 +3,7 @@
 # MiniDeflate v5.0 — Advanced Integration Test Suite
 #
 # Builds deflate.c in a disposable temp directory and exercises the binary
-# through 20 test cases covering:
+# through 28 test cases covering:
 #
 #   Category A  — CLI argument parsing and flags
 #   Category B  — Data integrity round-trips (edge-case payloads)
@@ -426,6 +426,23 @@ test_B09_large_multiblock() {
     assert_file_eq "$WORK_DIR/large.bin" "$WORK_DIR/large.out"
 }
 
+test_B10_folder_all_empty_files() {
+    mkdir -p "$WORK_DIR/all-empty/sub"
+    : > "$WORK_DIR/all-empty/a.bin"
+    : > "$WORK_DIR/all-empty/sub/b.bin"
+    : > "$WORK_DIR/all-empty/sub/c.bin"
+
+    run_in_workdir allempty_c "$BIN" -c ./all-empty ./all-empty.proz
+    assert_exit_ok
+    run_in_workdir allempty_d "$BIN" -d ./all-empty.proz ./all-empty-out
+    assert_exit_ok
+
+    assert_dir_eq "$WORK_DIR/all-empty" "$WORK_DIR/all-empty-out"
+    assert_file_size "$WORK_DIR/all-empty-out/a.bin" 0
+    assert_file_size "$WORK_DIR/all-empty-out/sub/b.bin" 0
+    assert_file_size "$WORK_DIR/all-empty-out/sub/c.bin" 0
+}
+
 test_B05_folder_roundtrip_nested_paths() {
     gen_folder_fixture "$WORK_DIR/folder-src"
     run_in_workdir folder_c "$BIN" -c ./folder-src ./folder.proz
@@ -643,6 +660,7 @@ main() {
     run_test test_B07_empty_file_roundtrip
     run_test test_B08_folder_with_empty_files
     run_test test_B09_large_multiblock
+    run_test test_B10_folder_all_empty_files
 
     # --- Category C: Format validation ---
     printf '\n%s\n' '--- Category C: Archive Format Validation ---'

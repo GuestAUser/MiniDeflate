@@ -145,6 +145,7 @@
 #define ADAPTIVE_MIN_TOKENS   16384
 #define ADAPTIVE_LONG_MATCH   200
 #define ADAPTIVE_POOR_MATCH   4
+#define LAZY_MATCH_MAX_LEN    32
 
 /* Distance coding: 30 codes per RFC 1951 */
 #define NUM_DIST_CODES        30
@@ -1522,6 +1523,62 @@ static bool should_flush_block_early(int32_t tok_count, int32_t match_len) {
     return false;
 }
 
+static inline void token_set_literal(Token *tok, uint8_t value) {
+    tok->type = 0;
+    tok->val = value;
+    tok->dist_code = 0;
+    tok->dist_extra = 0;
+    tok->dist_extra_bits = 0;
+}
+
+static inline void token_set_match(Token *tok, int32_t match_len, uint16_t dist) {
+    uint8_t d_code;
+    uint16_t d_extra;
+    uint8_t d_extra_bits;
+
+    dist_to_code(dist, &d_code, &d_extra, &d_extra_bits);
+
+    tok->type = 1;
+    tok->val = (uint16_t)((match_len - MIN_MATCH) + 257);
+    tok->dist_code = d_code;
+    tok->dist_extra = d_extra;
+    tok->dist_extra_bits = d_extra_bits;
+}
+
+static inline void prime_match_at_position(DeflateContext *ctx, uint16_t pos,
+                                           int32_t bytes_avail, int32_t *match_pos,
+                                           int32_t *match_len) {
+    *match_pos = 0;
+    *match_len = 0;
+
+    if (bytes_avail < MIN_MATCH) return;
+
+    find_best_match(ctx, pos, bytes_avail, match_pos, match_len);
+
+    uint32_t h = (bytes_avail >= 4) ? hash4(&ctx->window[pos]) : hash3(&ctx->window[pos]);
+    hash_insert(&ctx->hash_chain, h, pos);
+}
+
+/* Greedy parsing leaves ratio on the table for short matches. Probe the next
+ * position and prefer a literal when it unlocks a longer back-reference.
+ * Avoid probing across a window wrap because the hash chains are reset there. */
+static bool should_emit_literal_for_better_match(const DeflateContext *ctx,
+                                                 uint16_t read_pos,
+                                                 int32_t bytes_in_window,
+                                                 int32_t match_len) {
+    if (match_len < MIN_MATCH || match_len >= LAZY_MATCH_MAX_LEN) return false;
+    if (bytes_in_window <= MIN_MATCH) return false;
+    if (((read_pos + 1) & WINDOW_MASK) == 0) return false;
+
+    int32_t next_match_pos = 0;
+    int32_t next_match_len = 0;
+    find_best_match(ctx, (uint16_t)((read_pos + 1) & WINDOW_MASK),
+                    bytes_in_window - 1, &next_match_pos, &next_match_len);
+    (void)next_match_pos;
+
+    return next_match_len > match_len;
+}
+
 /**
  * FIX #1: Renamed variables for clarity.
  * - bytes_in_window: valid lookahead bytes available from current position
@@ -1618,12 +1675,7 @@ static DeflateError compress_file(const char *infile, const char *outfile) {
 
     int32_t match_pos = 0, match_len = 0;
 
-    /* FIX #5: Only call find_best_match if we have enough bytes */
-    if (bytes_in_window >= MIN_MATCH) {
-        find_best_match(ctx, read_pos, bytes_in_window, &match_pos, &match_len);
-        uint32_t h = (bytes_in_window >= 4) ? hash4(&ctx->window[read_pos]) : hash3(&ctx->window[read_pos]);
-        hash_insert(&ctx->hash_chain, h, read_pos);
-    }
+    prime_match_at_position(ctx, read_pos, bytes_in_window, &match_pos, &match_len);
 
     uint32_t crc = 0;
     ctx->bytes_out = 4;  /* Magic header */
@@ -1643,31 +1695,18 @@ static DeflateError compress_file(const char *infile, const char *outfile) {
             /* Clamp match length to available data */
             if (match_len > bytes_in_window) match_len = bytes_in_window;
 
-            if (match_len < MIN_MATCH) {
+            if (match_len < MIN_MATCH ||
+                should_emit_literal_for_better_match(ctx, read_pos, bytes_in_window, match_len)) {
                 /* Emit literal */
                 match_len = 1;
-                ctx->token_buf[tok_count].type = 0;
-                ctx->token_buf[tok_count].val = ctx->window[read_pos];
-                ctx->token_buf[tok_count].dist_code = 0;
-                ctx->token_buf[tok_count].dist_extra = 0;
-                ctx->token_buf[tok_count].dist_extra_bits = 0;
+                token_set_literal(&ctx->token_buf[tok_count], ctx->window[read_pos]);
 
                 uint8_t b = ctx->window[read_pos];
                 crc = update_crc32(&ctx->crc_tables, crc, &b, 1);
             } else {
                 /* Emit match with RFC 1951 distance coding */
-                ctx->token_buf[tok_count].type = 1;
-                ctx->token_buf[tok_count].val = (uint16_t)((match_len - 3) + 257);
-
                 uint16_t dist = (read_pos - match_pos) & WINDOW_MASK;
-                uint8_t d_code;
-                uint16_t d_extra;
-                uint8_t d_extra_bits;
-                dist_to_code(dist, &d_code, &d_extra, &d_extra_bits);
-
-                ctx->token_buf[tok_count].dist_code = d_code;
-                ctx->token_buf[tok_count].dist_extra = d_extra;
-                ctx->token_buf[tok_count].dist_extra_bits = d_extra_bits;
+                token_set_match(&ctx->token_buf[tok_count], match_len, dist);
 
                 crc = update_crc32(&ctx->crc_tables, crc, &ctx->window[read_pos], (size_t)match_len);
             }
@@ -1704,11 +1743,7 @@ static DeflateError compress_file(const char *infile, const char *outfile) {
 
                 /* Find next match */
                 int32_t new_pos = 0, new_len = 0;
-                if (bytes_in_window >= MIN_MATCH) {
-                    find_best_match(ctx, read_pos, bytes_in_window, &new_pos, &new_len);
-                    uint32_t h = (bytes_in_window >= 4) ? hash4(&ctx->window[read_pos]) : hash3(&ctx->window[read_pos]);
-                    hash_insert(&ctx->hash_chain, h, read_pos);
-                }
+                prime_match_at_position(ctx, read_pos, bytes_in_window, &new_pos, &new_len);
                 match_pos = new_pos;
                 match_len = new_len;
             }
@@ -1954,40 +1989,23 @@ static DeflateError compress_folder(const char *folder_path, const char *outfile
         if (bytes_in_window == 0) break;
 
         /* Find initial match */
-        if (bytes_in_window >= MIN_MATCH) {
-            find_best_match(ctx, read_pos, bytes_in_window, &match_pos, &match_len);
-            uint32_t h = (bytes_in_window >= 4) ? hash4(&ctx->window[read_pos]) : hash3(&ctx->window[read_pos]);
-            hash_insert(&ctx->hash_chain, h, read_pos);
-        }
+        prime_match_at_position(ctx, read_pos, bytes_in_window, &match_pos, &match_len);
 
         /* Build token block */
         int32_t tok_count = 0;
         while (tok_count < BLOCK_SIZE && bytes_in_window > 0) {
             if (match_len > bytes_in_window) match_len = bytes_in_window;
 
-            if (match_len < MIN_MATCH) {
+            if (match_len < MIN_MATCH ||
+                should_emit_literal_for_better_match(ctx, read_pos, bytes_in_window, match_len)) {
                 match_len = 1;
-                ctx->token_buf[tok_count].type = 0;
-                ctx->token_buf[tok_count].val = ctx->window[read_pos];
-                ctx->token_buf[tok_count].dist_code = 0;
-                ctx->token_buf[tok_count].dist_extra = 0;
-                ctx->token_buf[tok_count].dist_extra_bits = 0;
+                token_set_literal(&ctx->token_buf[tok_count], ctx->window[read_pos]);
 
                 uint8_t b = ctx->window[read_pos];
                 crc = update_crc32(&ctx->crc_tables, crc, &b, 1);
             } else {
-                ctx->token_buf[tok_count].type = 1;
-                ctx->token_buf[tok_count].val = (uint16_t)((match_len - 3) + 257);
-
                 uint16_t dist = (read_pos - match_pos) & WINDOW_MASK;
-                uint8_t d_code;
-                uint16_t d_extra;
-                uint8_t d_extra_bits;
-                dist_to_code(dist, &d_code, &d_extra, &d_extra_bits);
-
-                ctx->token_buf[tok_count].dist_code = d_code;
-                ctx->token_buf[tok_count].dist_extra = d_extra;
-                ctx->token_buf[tok_count].dist_extra_bits = d_extra_bits;
+                token_set_match(&ctx->token_buf[tok_count], match_len, dist);
 
                 crc = update_crc32(&ctx->crc_tables, crc, &ctx->window[read_pos], (size_t)match_len);
             }
@@ -2054,11 +2072,7 @@ static DeflateError compress_folder(const char *folder_path, const char *outfile
                 }
 
                 int32_t new_pos = 0, new_len = 0;
-                if (bytes_in_window >= MIN_MATCH) {
-                    find_best_match(ctx, read_pos, bytes_in_window, &new_pos, &new_len);
-                    uint32_t h = (bytes_in_window >= 4) ? hash4(&ctx->window[read_pos]) : hash3(&ctx->window[read_pos]);
-                    hash_insert(&ctx->hash_chain, h, read_pos);
-                }
+                prime_match_at_position(ctx, read_pos, bytes_in_window, &new_pos, &new_len);
                 match_pos = new_pos;
                 match_len = new_len;
             }
