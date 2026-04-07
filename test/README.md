@@ -2,7 +2,7 @@
 
 Integration tests for MiniDeflate v5.0. The suite builds `deflate.c` from
 source in an isolated temp directory and exercises the resulting binary through
-**27 test cases** organised into five categories.
+**28 test cases** organised into five categories.
 
 ---
 
@@ -52,7 +52,7 @@ Validates every documented flag and error path in `main()`.
 | `A06_missing_paths` | `-c` with one path but no output is rejected |
 | `A07_too_many_args` | Three positional arguments is rejected |
 
-### Category B — Data Integrity Round-Trips (9 tests)
+### Category B — Data Integrity Round-Trips (10 tests)
 
 Compress then decompress, assert bit-exact output. Covers edge-case payloads
 that stress different compressor code paths.
@@ -68,6 +68,7 @@ that stress different compressor code paths.
 | `B07_empty_file` | 0 bytes | Exact match, output is exactly 0 bytes (validates FIX #25) |
 | `B08_folder_empty_files` | Folder with 0-byte + non-empty files | Non-empty files extracted correctly alongside empty ones |
 | `B09_large_multiblock` | 2 MB seeded PRNG (seed 99) | Exact match, exercises multiple Huffman blocks |
+| `B10_folder_all_empty_files` | Folder with only 0-byte files, including nested paths | Recursive `diff -qr` match. Verifies every empty file is recreated |
 
 ### Category C — Archive Format Validation (5 tests)
 
@@ -183,13 +184,6 @@ test_B10_two_byte_roundtrip() {
 directory entries. Empty directories in the source tree are not recorded and
 will not be recreated on extraction. Directories that contain at least one file
 are created implicitly during extraction.
-
-**Zero-byte files in folder archives**: When all files in a folder archive are
-0 bytes, only the first file is created on extraction. Zero-byte files mixed
-with non-empty files extract correctly. This is a decompressor file-boundary
-edge case.
-
----
 
 ## CI Integration
 
