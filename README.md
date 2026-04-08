@@ -2,14 +2,14 @@
 
 ![MiniDeflate Logo](logo.png)
 
-**Production-grade, security-hardened DEFLATE-style compressor in pure C99.**
+**Single-file, security-focused DEFLATE-style compressor in pure C99.**
 
 [![Version](https://img.shields.io/badge/version-5.0.0-blue.svg)]()
 [![C99](https://img.shields.io/badge/C-99-green.svg)]()
 [![License](https://img.shields.io/badge/license-Proprietary-red.svg)]()
-[![Security](https://img.shields.io/badge/CVEs-0-brightgreen.svg)]()
+[![Security](https://img.shields.io/badge/security-defensive_checks-blue.svg)]()
 
-Single-file implementation (~2900 LOC) with **zero dependencies** beyond the C standard library. Compresses individual files and entire directories with RFC 1951-compliant distance coding. Security-audited for UB, bounds safety, and adversarial input resilience. Ships with a **32-test integration suite**.
+Single-file implementation (~2900 LOC) with **zero dependencies** beyond the C/POSIX runtime already used by the platform build. Compresses individual files and entire directories with RFC 1951-style distance coding. Includes bounds checks, path validation, snapshot-based folder compression, CRC32 payload verification, optional detached RSA/SHA-256 signature verification, and a **43-test integration suite**.
 
 ---
 
@@ -20,12 +20,12 @@ Single-file implementation (~2900 LOC) with **zero dependencies** beyond the C s
 | | zlib | MiniDeflate |
 |--|------|-------------|
 | Known CVEs | 10+ historical vulnerabilities | **0** |
-| Symlink Protection | No | **Yes** (openat/O_NOFOLLOW at all path levels) |
-| TOCTOU Prevention | No | **Yes** (atomic openat on POSIX, best-effort on Windows) |
+| Symlink Protection | No | **Yes** (POSIX `openat(O_NOFOLLOW)` walk; Windows best-effort reparse checks) |
+| TOCTOU Prevention | No | **Reduced** (folder inputs snapshotted before encoding; extraction staged before publish) |
 | Path Traversal | Vulnerable | **Blocked** (27 documented fixes) |
 | Zip Bomb Protection | Limited | **Yes** (50GB enforced limit) |
 
-MiniDeflate was designed security-first. Every input path, output path, and archive entry is validated. Symlinks are detected and rejected. Race conditions are eliminated with fail-closed checks.
+MiniDeflate validates archive paths, snapshots folder inputs before compression, stages decompression output so corrupt archives do not leave committed files behind, and can verify detached RSA/SHA-256 signatures over the exact archive bytes before extraction.
 
 ### More Complete Than miniz
 
@@ -37,7 +37,7 @@ MiniDeflate was designed security-first. Every input path, output path, and arch
 | Solid Mode | No | **Yes** |
 | Security Hardening | Minimal | **27 documented fixes** |
 
-While miniz focuses on being minimal, MiniDeflate delivers production-grade features without sacrificing the single-file simplicity.
+While miniz focuses on being minimal, MiniDeflate aims to keep the single-file simplicity while adding folder support, solid mode, and stricter extraction checks.
 
 ### Best Single-File Compressor on GitHub
 
@@ -50,15 +50,15 @@ While miniz focuses on being minimal, MiniDeflate delivers production-grade feat
 | Cross-Platform | Sometimes | **Windows + Unix** |
 | Professional CLI | Rare | **Yes** (-q, -v, --version) |
 
-Most single-file compressors are on side-projects or incomplete implementations, that's why they do not get where it's supposed to be. MiniDeflate is production-ready.
+MiniDeflate focuses on a compact, auditable implementation rather than container-format breadth.
 
-### Commercial-Grade Features
+### Operational Features
 
-MiniDeflate matches commercial compression tools in:
+MiniDeflate includes:
 
-- **Security** - Hardened against all OWASP archive vulnerabilities
+- **Security checks** - Path validation, source snapshotting for folder compression, staged extraction, CRC32 payload verification, detached RSA/SHA-256 signature verification
 - **Features** - Solid mode, folder archives, adaptive blocks
-- **Reliability** - CRC32 integrity, fail-closed design, zero memory leaks
+- **Reliability** - CRC32 integrity over payload bytes, staged cleanup on decompression failure
 - **Usability** - Professional CLI with quiet/verbose modes
 
 All in **~2900 lines of dependency-free C99**.
@@ -88,8 +88,15 @@ gcc -O3 -std=c99 -Wall -Wextra -Werror deflate.c -o deflate
 # Compress folder with solid mode (better ratio)
 ./deflate -c -s project/ project.proz
 
-# Decompress (auto-detects single file vs folder)
+# Decompress (auto-detects single file vs folder).
+# Existing output directories are allowed if extracted top-level names do not already exist.
 ./deflate -d project.proz output/
+
+# Verify a detached signature before extraction
+./deflate -d --sig project.sig --pubkey public.pem project.proz output/
+
+# Verify only
+./deflate --verify --sig project.sig --pubkey public.pem project.proz
 
 # Verbose output
 ./deflate -v -c largefile.bin largefile.proz
@@ -106,6 +113,7 @@ gcc -O3 -std=c99 -Wall -Wextra -Werror deflate.c -o deflate
 |---------|-------------|
 | **RFC 1951 Distance Coding** | 30 distance codes + extra bits for optimal compression |
 | **27 Security Fixes** | Hardened against path traversal, symlinks, TOCTOU, zip bombs |
+| **Detached Signature Verification** | Verifies RSA PKCS#1 v1.5 + SHA-256 signatures using PEM/DER public keys |
 | **Solid Archive Mode** | Cross-file LZ window for improved folder compression |
 | **Single Compilation Unit** | One `.c` file, compiles in under 1 second |
 | **Cross-Platform** | Windows (MSVC/MinGW) and Unix (Linux/macOS/BSD) |
@@ -203,14 +211,16 @@ Input --> [4-byte Hash] --> [Two-Phase Chain (8 fast / 128 full)]
 
 ## Security Model
 
-MiniDeflate implements **27 documented security fixes** for production use:
+MiniDeflate implements **27 documented security fixes** and several defensive runtime checks:
 
 | Threat | Mitigation |
 |--------|------------|
-| Path traversal (`../`) | Rejected by `is_safe_path()` with consistent checking |
+| Path traversal (`../`) | Rejected by `is_safe_archive_path()` with component-wise checking |
 | Absolute paths | Blocked (Unix `/`, Windows `C:`) |
-| Symlink attacks | `openat(O_NOFOLLOW)` at every path component during extraction |
-| TOCTOU races | Atomic openat on POSIX; best-effort check-then-open on Windows |
+| Source TOCTOU during folder compression | Files are snapshotted into a temporary stream before archive encoding |
+| Symlink attacks | POSIX extraction uses `openat(O_NOFOLLOW)` for walked components; output-root symlinks are rejected |
+| Extraction cleanup | Output is staged and only committed after size and CRC checks succeed |
+| Output directory flexibility | Existing output directories are allowed when extracted top-level names do not collide |
 | Zip bombs | 50GB output limit enforced incrementally |
 | Truncated archives | CRC read failure = fatal error (fail-closed) |
 | Buffer overflows | All window/buffer accesses bounds-checked |
@@ -219,9 +229,28 @@ MiniDeflate implements **27 documented security fixes** for production use:
 | Integer overflow | uint64_t counters for all size tracking |
 | Embedded null bytes | Detected and rejected in archive paths |
 | Malformed Huffman | Oversubscription and undersubscription validation on all code tables |
-| Parent dir symlinks | openat-based extraction rejects symlinks at all levels (ELOOP + ENOTDIR) |
+| Trailing archive bytes | Rejected after the CRC footer instead of being silently ignored |
+| Parent dir symlinks | POSIX extraction rejects symlinks while walking staged output paths (ELOOP + ENOTDIR) |
 | Compression symlinks | lstat skips symlinks during folder traversal |
 | CPU amplification | Undersubscribed Huffman trees rejected to prevent slow-path decode abuse |
+| Metadata / archive authenticity | Optional detached RSA/SHA-256 signature verification over exact archive bytes |
+
+CRC32 is retained for accidental corruption detection. It is **not** treated as an authentication boundary.
+
+### Detached Signature Workflow
+
+MiniDeflate does not store signatures inside the archive. Instead, it verifies a detached raw signature file against the exact archive bytes on disk.
+
+Example using OpenSSL-generated RSA keys:
+
+```bash
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out private.pem
+openssl pkey -in private.pem -pubout -out public.pem
+openssl dgst -sha256 -sign private.pem -binary -out project.sig project.proz
+
+./deflate --verify --sig project.sig --pubkey public.pem project.proz
+./deflate -d --sig project.sig --pubkey public.pem project.proz output/
+```
 
 ---
 
@@ -268,7 +297,7 @@ v5.0 includes CRC32 slice-by-4 and buffered I/O for improved throughput on large
 bash test/advanced_cli_tests.sh
 ```
 
-32 integration tests across 5 categories: CLI parsing, data round-trips (including absolute-path file/folder runs), format validation (including declared-size corruption cases), security hardening (CRC tampering, path traversal, symlink injection), and output modes. See [`test/README.md`](test/README.md) for details.
+43 integration tests across 5 categories: CLI parsing, data round-trips (including absolute-path file/folder runs), format validation (including declared-size corruption cases, malformed Huffman rejection, duplicate-path rejection, signature verification, and mutation-fuzz smoke coverage), security hardening (CRC tampering, path traversal, symlink-safe targets, flexible-but-safe output directories, signature-gated extraction, fail-closed extraction), and output modes. See [`test/README.md`](test/README.md) for details.
 
 ---
 
@@ -283,6 +312,7 @@ bash test/advanced_cli_tests.sh
 | -4 | `DEFLATE_ERR_CORRUPT` | Data corruption / CRC mismatch |
 | -5 | `DEFLATE_ERR_LIMIT` | Size limit exceeded |
 | -6 | `DEFLATE_ERR_PATH` | Unsafe path rejected |
+| -7 | `DEFLATE_ERR_AUTH` | Signature verification failed |
 
 ---
 

@@ -2,7 +2,7 @@
 
 Integration tests for MiniDeflate v5.0. The suite builds `deflate.c` from
 source in an isolated temp directory and exercises the resulting binary through
-**32 test cases** organised into five categories.
+**43 test cases** organised into five categories.
 
 ---
 
@@ -38,7 +38,7 @@ All tools are standard on Linux, macOS, and FreeBSD.
 
 ## Test Categories
 
-### Category A — CLI Argument Parsing (7 tests)
+### Category A — CLI Argument Parsing (8 tests)
 
 Validates every documented flag and error path in `main()`.
 
@@ -51,6 +51,7 @@ Validates every documented flag and error path in `main()`.
 | `A05_unknown_option` | `--bogus` is rejected |
 | `A06_missing_paths` | `-c` with one path but no output is rejected |
 | `A07_too_many_args` | Three positional arguments is rejected |
+| `A08_verify_requires_sig` | `--verify` without `--sig/--pubkey` is rejected |
 
 ### Category B — Data Integrity Round-Trips (12 tests)
 
@@ -72,7 +73,7 @@ that stress different compressor code paths.
 | `B11_absolute_file_paths` | Absolute host paths for input, archive, and output | Exact round-trip using non-relative CLI arguments |
 | `B12_absolute_folder_paths` | Absolute host paths for folder input, archive, and output directory | Recursive `diff -qr` match for folder mode |
 
-### Category C — Archive Format Validation (7 tests)
+### Category C — Archive Format Validation (12 tests)
 
 Tests the binary format layer: magic bytes, bad input, truncation.
 
@@ -83,20 +84,30 @@ Tests the binary format layer: magic bytes, bad input, truncation.
 | `C03_bad_magic` | Decompressing a non-archive file → `Unknown archive format` error |
 | `C04_truncated_archive` | Archive cut to 10 bytes → decompression error (no crash) |
 | `C05_nonexistent_input` | Missing input file → `Error opening input` on both `-c` and `-d` |
-| `C06_folder_size_too_large` | Folder archive with declared file size larger than encoded payload | Rejects with folder payload size mismatch before footer acceptance |
-| `C07_folder_size_too_small` | Folder archive with declared file size smaller than encoded payload | Rejects trailing decoded payload beyond declared file sizes |
+| `C06_folder_size_too_large` | Folder archive with declared file size larger than encoded payload | Rejects with folder payload size mismatch and leaves no extracted output |
+| `C07_folder_size_too_small` | Folder archive with declared file size smaller than encoded payload | Rejects trailing decoded payload beyond declared file sizes and leaves no extracted output |
+| `C08_trailing_data_after_footer` | Valid archive with bytes appended after CRC footer | Rejects trailing bytes instead of silently accepting them |
+| `C09_duplicate_archive_paths` | Folder archive with two entries normalized to the same output path | Rejects the archive before any output is committed |
+| `C10_missing_eob_huffman` | Archive with a complete Huffman tree that omits symbol 256 | Rejects canonical tables that cannot produce an end-of-block marker |
+| `C11_mutation_fuzz_no_crash` | 100 random byte mutations of a valid archive | Decompressor never hangs or crashes on the mutation corpus |
+| `C12_signature_verify_success` | Detached RSA/SHA-256 signature over a valid archive | `--verify` succeeds and reports `Signature Verified` |
 
-### Category D — Security Hardening (4 tests)
+### Category D — Security Hardening (9 tests)
 
 Validates the 27 documented security fixes. These are adversarial tests that
 craft malicious inputs and verify fail-closed behaviour.
 
 | Test | Threat Model | Key Assertion |
 |------|-------------|---------------|
-| `D01_crc_corruption` | Bit-flip in CRC footer of a valid archive | `CRC Mismatch` error, non-zero exit |
+| `D01_crc_corruption` | Bit-flip in CRC footer of a valid archive | `CRC Mismatch` error, non-zero exit, no output file left behind |
 | `D02_path_traversal` | `../` injected into archive file table via binary patching | `Unsafe path in archive` error, escape file does not exist |
-| `D03_intermediate_symlink` | Symlink planted at intermediate directory in extraction tree | `symlink in path` diagnostic, extraction fails, payload not written to symlink target |
+| `D03_output_root_symlink` | Folder extraction root is a symlink to another directory | Extraction is rejected before any payload is written to the symlink target |
 | `D04_output_symlink` | Output path is a symlink to another file | `Output path is a symlink` error, target file not overwritten |
+| `D05_existing_output_dir` | Folder extraction target already contains unrelated files | Extraction succeeds without modifying unrelated pre-existing files |
+| `D06_folder_crc_cleanup` | CRC-corrupted folder archive | Extraction fails and leaves no extracted directory behind |
+| `D07_existing_output_conflict` | Folder extraction target already contains a colliding top-level name | Extraction is rejected before any archive content is committed |
+| `D08_signed_decompress_tampered` | Archive is modified after a detached signature is generated | Signature verification fails and decompression leaves no output behind |
+| `D09_signature_wrong_key` | Archive signature checked with the wrong RSA public key | `--verify` fails authentication |
 
 #### Path Traversal Test Details
 
@@ -111,13 +122,11 @@ then patches bytes 10..17 to "../ab.cd" (also 8 chars). is_safe_archive_path()
 rejects the ".." component.
 ```
 
-#### Symlink Test Details
+#### Output Root Symlink Test Details
 
-The `D03` test verifies the `openat(O_NOFOLLOW)` extraction path (FIX #22).
-A symlink is planted at `$out_dir/nested` → `$escape_dir`. When the
-decompressor walks `nested/payload.txt`, `openat` refuses to traverse the
-symlink. The test asserts both: extraction failure AND no file appears in the
-escape directory.
+The `D03` test verifies that folder extraction refuses to use a symlinked
+output root. A symlink is planted at `$out_dir` → `$escape_dir`. Extraction
+must fail before any staging directory is committed to the final destination.
 
 ### Category E — Output Modes (2 tests)
 
@@ -187,6 +196,11 @@ test_B10_two_byte_roundtrip() {
 directory entries. Empty directories in the source tree are not recorded and
 will not be recreated on extraction. Directories that contain at least one file
 are created implicitly during extraction.
+
+**Folder extraction conflicts are still fail-closed**: Folder decompression now
+uses a staging directory and only commits output after the archive passes size,
+CRC, and optional signature validation. Existing output directories are allowed,
+but extraction is rejected if any extracted top-level path already exists.
 
 ## CI Integration
 
