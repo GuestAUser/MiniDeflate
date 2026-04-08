@@ -71,6 +71,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <limits.h>
+#include <time.h>
 #include <stdarg.h>
 
 /* Version info */
@@ -86,6 +87,7 @@
 #else
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
@@ -140,6 +142,8 @@
 #define MAX_HUFFMAN_DEPTH     15
 #define MAX_DECODE_ITERATIONS 64
 #define MAX_BLOCKS            4000000
+#define RSA_MAX_BITS          4096
+#define RSA_MAX_WORDS         (RSA_MAX_BITS / 32)
 
 /* Adaptive block thresholds */
 #define ADAPTIVE_MIN_TOKENS   16384
@@ -157,7 +161,8 @@ typedef enum {
     DEFLATE_ERR_FORMAT = -3,
     DEFLATE_ERR_CORRUPT = -4,
     DEFLATE_ERR_LIMIT = -5,
-    DEFLATE_ERR_PATH = -6
+    DEFLATE_ERR_PATH = -6,
+    DEFLATE_ERR_AUTH = -7
 } DeflateError;
 
 /* Verbosity levels */
@@ -169,6 +174,12 @@ typedef enum {
 
 static LogLevel g_log_level = LOG_NORMAL;
 static bool g_solid_mode = false;
+
+#if PLATFORM_WINDOWS
+#define FDOPEN _fdopen
+#else
+#define FDOPEN fdopen
+#endif
 
 /* ==================== LOGGING SYSTEM ==================== */
 
@@ -284,6 +295,24 @@ typedef struct {
     uint8_t bits_used;
 } FastDecodeEntry;
 
+typedef struct {
+    uint32_t words[RSA_MAX_WORDS];
+    size_t nwords;
+} BigUint;
+
+typedef struct {
+    BigUint modulus;
+    uint32_t exponent;
+    size_t modulus_len;
+} RsaPublicKey;
+
+typedef struct {
+    uint32_t state[8];
+    uint64_t bit_count;
+    uint8_t buffer[64];
+    size_t buffer_len;
+} SHA256Ctx;
+
 /**
  * BitStream - Buffered bit I/O with MSB-first ordering.
  *
@@ -366,6 +395,12 @@ typedef struct {
     uint32_t count;
     uint32_t capacity;
 } FileList;
+
+typedef struct {
+    char **items;
+    uint32_t count;
+    uint32_t capacity;
+} NameList;
 
 /* ==================== MACROS ==================== */
 
@@ -551,6 +586,36 @@ static void filelist_destroy(FileList *fl) {
     }
 }
 
+static void namelist_destroy(NameList *nl) {
+    if (!nl) return;
+    for (uint32_t i = 0; i < nl->count; i++) {
+        free(nl->items[i]);
+    }
+    free(nl->items);
+    nl->items = NULL;
+    nl->count = 0;
+    nl->capacity = 0;
+}
+
+static bool namelist_add(NameList *nl, const char *name) {
+    if (!nl || !name) return false;
+
+    if (nl->count >= nl->capacity) {
+        uint32_t new_cap = (nl->capacity == 0) ? 16 : (nl->capacity * 2);
+        char **new_items = realloc(nl->items, sizeof(char*) * new_cap);
+        if (!new_items) return false;
+        nl->items = new_items;
+        nl->capacity = new_cap;
+    }
+
+    size_t len = strlen(name);
+    char *copy = malloc(len + 1);
+    if (!copy) return false;
+    memcpy(copy, name, len + 1);
+    nl->items[nl->count++] = copy;
+    return true;
+}
+
 static bool filelist_add(FileList *fl, const char *path, uint64_t size) {
     if (fl->count >= MAX_FILES_IN_ARCHIVE) return false;
     size_t path_len = strlen(path);
@@ -572,6 +637,64 @@ static bool filelist_add(FileList *fl, const char *path, uint64_t size) {
     return true;
 }
 
+#if PLATFORM_WINDOWS
+static unsigned char ascii_tolower_uc(unsigned char c) {
+    return (c >= 'A' && c <= 'Z') ? (unsigned char)(c + ('a' - 'A')) : c;
+}
+
+static unsigned char ascii_toupper_uc(unsigned char c) {
+    return (c >= 'a' && c <= 'z') ? (unsigned char)(c - ('a' - 'A')) : c;
+}
+#endif
+
+static int archive_path_key_compare(const char *a, const char *b) {
+#if PLATFORM_WINDOWS
+    while (*a && *b) {
+        unsigned char ca = (unsigned char)*a;
+        unsigned char cb = (unsigned char)*b;
+        ca = ascii_tolower_uc(ca);
+        cb = ascii_tolower_uc(cb);
+        if (ca != cb) return (ca < cb) ? -1 : 1;
+        a++;
+        b++;
+    }
+    if (*a == *b) return 0;
+    return (*a == '\0') ? -1 : 1;
+#else
+    return strcmp(a, b);
+#endif
+}
+
+static int archive_path_ptr_compare(const void *lhs, const void *rhs) {
+    const char *const *a = lhs;
+    const char *const *b = rhs;
+    return archive_path_key_compare(*a, *b);
+}
+
+static DeflateError ensure_unique_archive_paths(const FileList *fl) {
+    if (!fl || fl->count < 2) return DEFLATE_OK;
+
+    char **paths = malloc(sizeof(char*) * fl->count);
+    if (!paths) return DEFLATE_ERR_MEM;
+
+    for (uint32_t i = 0; i < fl->count; i++) {
+        paths[i] = fl->entries[i].path;
+    }
+
+    qsort(paths, fl->count, sizeof(char*), archive_path_ptr_compare);
+
+    DeflateError result = DEFLATE_OK;
+    for (uint32_t i = 1; i < fl->count; i++) {
+        if (archive_path_key_compare(paths[i - 1], paths[i]) == 0) {
+            result = DEFLATE_ERR_PATH;
+            break;
+        }
+    }
+
+    free(paths);
+    return result;
+}
+
 /* Normalize path separators to forward slashes */
 static void normalize_path(char *path) {
     for (char *p = path; *p; p++) {
@@ -579,29 +702,458 @@ static void normalize_path(char *path) {
     }
 }
 
-static DeflateError join_path_checked(char *dst, size_t dst_size,
-                                      const char *base, const char *rel) {
-    int written = snprintf(dst, dst_size, "%s/%s", base, rel);
-    if (written < 0 || (size_t)written >= dst_size) {
-        LOG_ERR("Error: Path too long\n");
+static bool path_exists(const char *path) {
+#if PLATFORM_WINDOWS
+    return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+#else
+    struct stat st;
+    return lstat(path, &st) == 0;
+#endif
+}
+
+static bool path_is_symlink(const char *path) {
+#if PLATFORM_WINDOWS
+    DWORD attrs = GetFileAttributesA(path);
+    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+#else
+    struct stat st;
+    return lstat(path, &st) == 0 && S_ISLNK(st.st_mode);
+#endif
+}
+
+static bool path_is_directory_nofollow(const char *path) {
+#if PLATFORM_WINDOWS
+    DWORD attrs = GetFileAttributesA(path);
+    return attrs != INVALID_FILE_ATTRIBUTES &&
+           (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
+           (attrs & FILE_ATTRIBUTE_REPARSE_POINT) == 0;
+#else
+    struct stat st;
+    return lstat(path, &st) == 0 && S_ISDIR(st.st_mode);
+#endif
+}
+
+static bool remove_path_if_exists(const char *path) {
+#if PLATFORM_WINDOWS
+    return DeleteFileA(path) != 0 || GetLastError() == ERROR_FILE_NOT_FOUND;
+#else
+    return unlink(path) == 0 || errno == ENOENT;
+#endif
+}
+
+static bool rename_path_atomic(const char *src, const char *dst, bool replace_existing) {
+#if PLATFORM_WINDOWS
+    DWORD flags = replace_existing ? MOVEFILE_REPLACE_EXISTING : 0;
+    return MoveFileExA(src, dst, flags) != 0;
+#else
+    if (!replace_existing && path_exists(dst)) return false;
+    return rename(src, dst) == 0;
+#endif
+}
+
+static bool remove_empty_directory(const char *path) {
+#if PLATFORM_WINDOWS
+    return RemoveDirectoryA(path) != 0;
+#else
+    return rmdir(path) == 0;
+#endif
+}
+
+static uint32_t temp_nonce(void) {
+    static uint32_t counter = 0;
+    counter++;
+#if PLATFORM_WINDOWS
+    return (uint32_t)GetCurrentProcessId() ^ (uint32_t)GetTickCount() ^ (counter * 2654435761U);
+#else
+    return (uint32_t)getpid() ^ (uint32_t)time(NULL) ^ (counter * 2654435761U);
+#endif
+}
+
+static bool alloc_temp_sibling_path(const char *target, const char *tag,
+                                    uint32_t nonce, char **out_path) {
+    size_t len = strlen(target) + strlen(tag) + 32;
+    char *path = malloc(len);
+    if (!path) return false;
+
+    int written = snprintf(path, len, "%s.%s.%08X", target, tag, (unsigned)nonce);
+    if (written < 0 || (size_t)written >= len) {
+        free(path);
+        return false;
+    }
+
+    *out_path = path;
+    return true;
+}
+
+static FILE* open_unique_temp_file_sibling(const char *target, char **temp_path_out) {
+    for (int attempt = 0; attempt < 128; attempt++) {
+        char *candidate = NULL;
+        if (!alloc_temp_sibling_path(target, "minideflate-tmp",
+                                     temp_nonce() ^ (uint32_t)attempt, &candidate)) {
+            return NULL;
+        }
+
+#if PLATFORM_WINDOWS
+        HANDLE h = CreateFileA(candidate, GENERIC_WRITE, 0, NULL, CREATE_NEW,
+                               FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h == INVALID_HANDLE_VALUE) {
+            DWORD err = GetLastError();
+            free(candidate);
+            if (err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS) continue;
+            return NULL;
+        }
+
+        int fd = _open_osfhandle((intptr_t)h, _O_WRONLY | _O_BINARY);
+        if (fd < 0) {
+            CloseHandle(h);
+            remove_path_if_exists(candidate);
+            free(candidate);
+            return NULL;
+        }
+#else
+        int fd = open(candidate, O_WRONLY | O_CREAT | O_EXCL
+#ifdef O_NOFOLLOW
+                      | O_NOFOLLOW
+#endif
+                      , 0644);
+        if (fd < 0) {
+            int saved_errno = errno;
+            free(candidate);
+            if (saved_errno == EEXIST) continue;
+            errno = saved_errno;
+            return NULL;
+        }
+#endif
+
+        FILE *fp = FDOPEN(fd, "wb");
+        if (!fp) {
+#if PLATFORM_WINDOWS
+            _close(fd);
+#else
+            close(fd);
+#endif
+            remove_path_if_exists(candidate);
+            free(candidate);
+            return NULL;
+        }
+
+        *temp_path_out = candidate;
+        return fp;
+    }
+
+    return NULL;
+}
+
+static bool create_unique_temp_sibling_directory(const char *target, char **temp_path_out) {
+    for (int attempt = 0; attempt < 128; attempt++) {
+        char *candidate = NULL;
+        if (!alloc_temp_sibling_path(target, "minideflate-stage",
+                                     temp_nonce() ^ (uint32_t)attempt, &candidate)) {
+            return false;
+        }
+
+#if PLATFORM_WINDOWS
+        if (CreateDirectoryA(candidate, NULL)) {
+            *temp_path_out = candidate;
+            return true;
+        }
+        DWORD err = GetLastError();
+        free(candidate);
+        if (err == ERROR_ALREADY_EXISTS) continue;
+        return false;
+#else
+        if (mkdir(candidate, 0700) == 0) {
+            *temp_path_out = candidate;
+            return true;
+        }
+        int saved_errno = errno;
+        free(candidate);
+        if (saved_errno == EEXIST) continue;
+        errno = saved_errno;
+        return false;
+#endif
+    }
+
+    return false;
+}
+
+static bool remove_tree_recursive(const char *path) {
+#if PLATFORM_WINDOWS
+    DWORD attrs = GetFileAttributesA(path);
+    if (attrs == INVALID_FILE_ATTRIBUTES) return GetLastError() == ERROR_FILE_NOT_FOUND;
+    if ((attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+        (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+        return DeleteFileA(path) != 0;
+    }
+
+    size_t search_len = strlen(path) + 4;
+    char *search = malloc(search_len);
+    if (!search) return false;
+    snprintf(search, search_len, "%s/*", path);
+    for (char *p = search; *p; p++) {
+        if (*p == '/') *p = '\\';
+    }
+
+    WIN32_FIND_DATAA ffd;
+    HANDLE hFind = FindFirstFileA(search, &ffd);
+    free(search);
+    if (hFind == INVALID_HANDLE_VALUE) return false;
+
+    bool ok = true;
+    do {
+        if (strcmp(ffd.cFileName, ".") == 0 || strcmp(ffd.cFileName, "..") == 0) continue;
+
+        size_t child_len = strlen(path) + strlen(ffd.cFileName) + 2;
+        char *child = malloc(child_len);
+        if (!child) {
+            ok = false;
+            break;
+        }
+        snprintf(child, child_len, "%s/%s", path, ffd.cFileName);
+
+        if (!remove_tree_recursive(child)) ok = false;
+        free(child);
+        if (!ok) break;
+    } while (FindNextFileA(hFind, &ffd));
+
+    FindClose(hFind);
+    return ok && RemoveDirectoryA(path) != 0;
+#else
+    struct stat st;
+    if (lstat(path, &st) != 0) return errno == ENOENT;
+    if (!S_ISDIR(st.st_mode) || S_ISLNK(st.st_mode)) {
+        return unlink(path) == 0 || errno == ENOENT;
+    }
+
+    DIR *dir = opendir(path);
+    if (!dir) return false;
+
+    bool ok = true;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+
+        size_t child_len = strlen(path) + strlen(entry->d_name) + 2;
+        char *child = malloc(child_len);
+        if (!child) {
+            ok = false;
+            break;
+        }
+        snprintf(child, child_len, "%s/%s", path, entry->d_name);
+
+        if (!remove_tree_recursive(child)) ok = false;
+        free(child);
+        if (!ok) break;
+    }
+
+    closedir(dir);
+    if (!ok) return false;
+    return rmdir(path) == 0;
+#endif
+}
+
+static bool create_directory_recursive(const char *path);
+static bool ensure_parent_directories(const char *path);
+
+static bool list_top_level_directory_entries(const char *dir_path, NameList *names) {
+#if PLATFORM_WINDOWS
+    size_t search_len = strlen(dir_path) + 4;
+    char *search = malloc(search_len);
+    if (!search) return false;
+    snprintf(search, search_len, "%s/*", dir_path);
+    for (char *p = search; *p; p++) {
+        if (*p == '/') *p = '\\';
+    }
+
+    WIN32_FIND_DATAA ffd;
+    HANDLE hFind = FindFirstFileA(search, &ffd);
+    free(search);
+    if (hFind == INVALID_HANDLE_VALUE) return false;
+
+    bool ok = true;
+    do {
+        if (strcmp(ffd.cFileName, ".") == 0 || strcmp(ffd.cFileName, "..") == 0) continue;
+        if (!namelist_add(names, ffd.cFileName)) {
+            ok = false;
+            break;
+        }
+    } while (FindNextFileA(hFind, &ffd));
+
+    FindClose(hFind);
+    return ok;
+#else
+    DIR *dir = opendir(dir_path);
+    if (!dir) return false;
+
+    bool ok = true;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        if (!namelist_add(names, entry->d_name)) {
+            ok = false;
+            break;
+        }
+    }
+
+    closedir(dir);
+    return ok;
+#endif
+}
+
+static bool commit_staged_children(const char *stage_dir, const char *out_dir) {
+    NameList names = {0};
+    NameList moved = {0};
+    bool ok = list_top_level_directory_entries(stage_dir, &names);
+    if (!ok) {
+        namelist_destroy(&names);
+        return false;
+    }
+
+    for (uint32_t i = 0; i < names.count; i++) {
+        size_t dst_len = strlen(out_dir) + strlen(names.items[i]) + 2;
+        char *dst = malloc(dst_len);
+        if (!dst) {
+            ok = false;
+            break;
+        }
+        snprintf(dst, dst_len, "%s/%s", out_dir, names.items[i]);
+        normalize_path(dst);
+
+        if (path_exists(dst)) {
+            free(dst);
+            ok = false;
+            break;
+        }
+        free(dst);
+    }
+
+    for (uint32_t i = 0; ok && i < names.count; i++) {
+        size_t src_len = strlen(stage_dir) + strlen(names.items[i]) + 2;
+        size_t dst_len = strlen(out_dir) + strlen(names.items[i]) + 2;
+        char *src = malloc(src_len);
+        char *dst = malloc(dst_len);
+        if (!src || !dst) {
+            free(src);
+            free(dst);
+            ok = false;
+            break;
+        }
+
+        snprintf(src, src_len, "%s/%s", stage_dir, names.items[i]);
+        snprintf(dst, dst_len, "%s/%s", out_dir, names.items[i]);
+        normalize_path(src);
+        normalize_path(dst);
+
+        if (!rename_path_atomic(src, dst, false) || !namelist_add(&moved, names.items[i])) {
+            free(src);
+            free(dst);
+            ok = false;
+            break;
+        }
+
+        free(src);
+        free(dst);
+    }
+
+    if (!ok) {
+        for (uint32_t i = moved.count; i > 0; i--) {
+            size_t src_len = strlen(out_dir) + strlen(moved.items[i - 1]) + 2;
+            size_t dst_len = strlen(stage_dir) + strlen(moved.items[i - 1]) + 2;
+            char *src = malloc(src_len);
+            char *dst = malloc(dst_len);
+            if (!src || !dst) {
+                free(src);
+                free(dst);
+                break;
+            }
+
+            snprintf(src, src_len, "%s/%s", out_dir, moved.items[i - 1]);
+            snprintf(dst, dst_len, "%s/%s", stage_dir, moved.items[i - 1]);
+            normalize_path(src);
+            normalize_path(dst);
+            (void)rename_path_atomic(src, dst, false);
+            free(src);
+            free(dst);
+        }
+    }
+
+    namelist_destroy(&moved);
+    namelist_destroy(&names);
+    return ok && remove_empty_directory(stage_dir);
+}
+
+static DeflateError prepare_output_stage_directory(const char *out_dir,
+                                                   char **stage_dir_out,
+                                                   bool *output_dir_exists) {
+    *stage_dir_out = NULL;
+    *output_dir_exists = false;
+
+    if (path_is_symlink(out_dir)) {
+        LOG_ERR("Error: Output directory is a symlink (security risk)\n");
         return DEFLATE_ERR_PATH;
     }
-    normalize_path(dst);
+
+    if (path_exists(out_dir)) {
+        if (!path_is_directory_nofollow(out_dir)) {
+            LOG_ERR("Error: Output path exists and is not a directory\n");
+            return DEFLATE_ERR_PATH;
+        }
+        *output_dir_exists = true;
+    }
+
+    if (!ensure_parent_directories(out_dir)) {
+        LOG_ERR("Error: Cannot create parent directories for output\n");
+        return DEFLATE_ERR_IO;
+    }
+
+    if (!create_unique_temp_sibling_directory(out_dir, stage_dir_out)) {
+        perror("Error creating staging directory");
+        return DEFLATE_ERR_IO;
+    }
+
     return DEFLATE_OK;
+}
+
+static bool commit_output_stage_directory(const char *stage_dir, const char *out_dir,
+                                          bool output_dir_exists) {
+    if (path_is_symlink(out_dir)) return false;
+
+    if (!output_dir_exists) {
+        return rename_path_atomic(stage_dir, out_dir, false);
+    }
+
+    if (!path_is_directory_nofollow(out_dir)) return false;
+    return commit_staged_children(stage_dir, out_dir);
+}
+
+static bool bs_has_trailing_data(BitStream *bs) {
+    if (bs->bit_count != 0) return true;
+    if (bs->pos < bs->bytes_in_buf) return true;
+
+    uint8_t byte;
+    size_t n = fread(&byte, 1, 1, bs->fp);
+    return n != 0 || ferror(bs->fp);
 }
 
 /* Create directory (and parents if needed) */
 static bool create_directory_recursive(const char *path) {
-    char tmp[MAX_PATH_LEN];
-    strncpy(tmp, path, MAX_PATH_LEN - 1);
-    tmp[MAX_PATH_LEN - 1] = '\0';
+    size_t len = strlen(path);
+    char *tmp = malloc(len + 1);
+    if (!tmp) return false;
+    memcpy(tmp, path, len + 1);
 
-    size_t len = strlen(tmp);
-    if (len == 0) return true;
+    if (len == 0) {
+        free(tmp);
+        return true;
+    }
 
     /* Remove trailing slash */
     if (tmp[len - 1] == '/' || tmp[len - 1] == '\\') {
         tmp[len - 1] = '\0';
+    }
+    if (tmp[0] == '\0') {
+        free(tmp);
+        return true;
     }
 
     /* Create each directory in path */
@@ -618,15 +1170,80 @@ static bool create_directory_recursive(const char *path) {
     }
 
 #if PLATFORM_WINDOWS
-    return CreateDirectoryA(tmp, NULL) || GetLastError() == ERROR_ALREADY_EXISTS;
+    bool ok = CreateDirectoryA(tmp, NULL) || GetLastError() == ERROR_ALREADY_EXISTS;
 #else
-    return mkdir(tmp, 0755) == 0 || errno == EEXIST;
+    bool ok = mkdir(tmp, 0755) == 0 || errno == EEXIST;
 #endif
+
+    free(tmp);
+    return ok;
 }
 
-/* Recursive directory traversal */
+static bool ensure_parent_directories(const char *path) {
+    const char *slash1 = strrchr(path, '/');
+    const char *slash2 = strrchr(path, '\\');
+    const char *slash = slash1;
+    if (!slash || (slash2 && slash2 > slash)) slash = slash2;
+    if (!slash) return true;
+
+    size_t parent_len = (size_t)(slash - path);
+    if (parent_len == 0) return true;
+    if (parent_len == 2 && path[1] == ':') return true;
+
+    char *parent = malloc(parent_len + 1);
+    if (!parent) return false;
+    memcpy(parent, path, parent_len);
+    parent[parent_len] = '\0';
+
+    bool ok = create_directory_recursive(parent);
+    free(parent);
+    return ok;
+}
+
+static DeflateError copy_snapshot_bytes(FILE *snapshot_fp, const uint8_t *buf, size_t n,
+                                        uint64_t *copied_bytes, uint64_t *total_bytes) {
+    if (n == 0) return DEFLATE_OK;
+    if (*total_bytes > MAX_INPUT_SIZE - (uint64_t)n) {
+        LOG_ERR("Error: Total input exceeds %llu byte limit\n",
+                (unsigned long long)MAX_INPUT_SIZE);
+        return DEFLATE_ERR_LIMIT;
+    }
+    if (fwrite(buf, 1, n, snapshot_fp) != n) {
+        return DEFLATE_ERR_IO;
+    }
+    *copied_bytes += (uint64_t)n;
+    *total_bytes += (uint64_t)n;
+    return DEFLATE_OK;
+}
+
 #if PLATFORM_WINDOWS
-static bool traverse_directory(const char *base_path, const char *rel_path, FileList *fl) {
+static DeflateError snapshot_file_windows(const char *full_path, FILE *snapshot_fp,
+                                          uint64_t *copied_bytes, uint64_t *total_bytes) {
+    HANDLE h = CreateFileA(full_path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        return DEFLATE_ERR_IO;
+    }
+
+    uint8_t buf[IO_BUFFER_SIZE];
+    DWORD got = 0;
+    DeflateError result = DEFLATE_OK;
+    while (ReadFile(h, buf, (DWORD)sizeof(buf), &got, NULL) && got > 0) {
+        result = copy_snapshot_bytes(snapshot_fp, buf, (size_t)got, copied_bytes, total_bytes);
+        if (result != DEFLATE_OK) break;
+    }
+
+    if (result == DEFLATE_OK && GetLastError() != ERROR_SUCCESS && got == 0) {
+        result = DEFLATE_ERR_IO;
+    }
+
+    CloseHandle(h);
+    return result;
+}
+
+static DeflateError snapshot_directory_windows(const char *base_path, const char *rel_path,
+                                               FileList *fl, FILE *snapshot_fp,
+                                               uint64_t *total_bytes) {
     char search_path[MAX_PATH_LEN * 2 + 4];
     char full_path[MAX_PATH_LEN * 2 + 2];
     char new_rel[MAX_PATH_LEN];
@@ -634,126 +1251,232 @@ static bool traverse_directory(const char *base_path, const char *rel_path, File
     HANDLE hFind;
 
     if (rel_path[0]) {
-        snprintf(search_path, sizeof(search_path), "%s/%s/*", base_path, rel_path);
+        int written = snprintf(search_path, sizeof(search_path), "%s/%s/*", base_path, rel_path);
+        if (written < 0 || (size_t)written >= sizeof(search_path)) return DEFLATE_ERR_PATH;
     } else {
-        snprintf(search_path, sizeof(search_path), "%s/*", base_path);
+        int written = snprintf(search_path, sizeof(search_path), "%s/*", base_path);
+        if (written < 0 || (size_t)written >= sizeof(search_path)) return DEFLATE_ERR_PATH;
     }
     normalize_path(search_path);
 
-    /* Convert back to backslash for Windows API */
-    char win_search[MAX_PATH_LEN * 2 + 4];
-    strncpy(win_search, search_path, sizeof(win_search) - 1);
-    win_search[sizeof(win_search) - 1] = '\0';
-    for (char *p = win_search; *p; p++) {
-        if (*p == '/') *p = '\\';
-    }
-
-    hFind = FindFirstFileA(win_search, &ffd);
-    if (hFind == INVALID_HANDLE_VALUE) {
-        return false;
-    }
-
-    do {
-        /* Skip . and .. */
-        if (strcmp(ffd.cFileName, ".") == 0 || strcmp(ffd.cFileName, "..") == 0) {
-            continue;
+    {
+        char win_search[MAX_PATH_LEN * 2 + 4];
+        strncpy(win_search, search_path, sizeof(win_search) - 1);
+        win_search[sizeof(win_search) - 1] = '\0';
+        for (char *p = win_search; *p; p++) {
+            if (*p == '/') *p = '\\';
         }
+        hFind = FindFirstFileA(win_search, &ffd);
+    }
+    if (hFind == INVALID_HANDLE_VALUE) return DEFLATE_ERR_IO;
 
-        /* Build relative path */
+    DeflateError result = DEFLATE_OK;
+    do {
+        if (strcmp(ffd.cFileName, ".") == 0 || strcmp(ffd.cFileName, "..") == 0) continue;
+        if (ffd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+
         if (rel_path[0]) {
-            snprintf(new_rel, MAX_PATH_LEN, "%s/%s", rel_path, ffd.cFileName);
+            int written = snprintf(new_rel, sizeof(new_rel), "%s/%s", rel_path, ffd.cFileName);
+            if (written < 0 || (size_t)written >= sizeof(new_rel)) {
+                result = DEFLATE_ERR_PATH;
+                break;
+            }
         } else {
-            snprintf(new_rel, MAX_PATH_LEN, "%s", ffd.cFileName);
+            int written = snprintf(new_rel, sizeof(new_rel), "%s", ffd.cFileName);
+            if (written < 0 || (size_t)written >= sizeof(new_rel)) {
+                result = DEFLATE_ERR_PATH;
+                break;
+            }
         }
         normalize_path(new_rel);
 
-        /* Build full path */
-        snprintf(full_path, sizeof(full_path), "%s/%s", base_path, new_rel);
+        {
+            int written = snprintf(full_path, sizeof(full_path), "%s/%s", base_path, new_rel);
+            if (written < 0 || (size_t)written >= sizeof(full_path)) {
+                result = DEFLATE_ERR_PATH;
+                break;
+            }
+        }
         normalize_path(full_path);
 
         if (ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            /* Recurse into subdirectory */
-            if (!traverse_directory(base_path, new_rel, fl)) {
-                FindClose(hFind);
-                return false;
-            }
+            result = snapshot_directory_windows(base_path, new_rel, fl, snapshot_fp, total_bytes);
+            if (result != DEFLATE_OK) break;
         } else {
-            /* Add file to list */
-            uint64_t size = ((uint64_t)ffd.nFileSizeHigh << 32) | ffd.nFileSizeLow;
-            if (!filelist_add(fl, new_rel, size)) {
-                FindClose(hFind);
-                return false;
+            uint64_t copied = 0;
+            result = snapshot_file_windows(full_path, snapshot_fp, &copied, total_bytes);
+            if (result != DEFLATE_OK) break;
+            if (!filelist_add(fl, new_rel, copied)) {
+                result = DEFLATE_ERR_LIMIT;
+                break;
             }
         }
     } while (FindNextFileA(hFind, &ffd));
 
     FindClose(hFind);
-    return true;
+    return result;
 }
 #else
-#include <dirent.h>
+static DeflateError snapshot_file_posix(int fd, FILE *snapshot_fp,
+                                        uint64_t *copied_bytes, uint64_t *total_bytes) {
+    uint8_t buf[IO_BUFFER_SIZE];
+    DeflateError result = DEFLATE_OK;
 
-static bool traverse_directory(const char *base_path, const char *rel_path, FileList *fl) {
-    char dir_path[MAX_PATH_LEN * 2 + 2];
-    char full_path[MAX_PATH_LEN * 2 + 2];
-    char new_rel[MAX_PATH_LEN];
-    DIR *dir;
-    struct dirent *entry;
-    struct stat st;
-
-    if (rel_path[0]) {
-        snprintf(dir_path, sizeof(dir_path), "%s/%s", base_path, rel_path);
-    } else {
-        snprintf(dir_path, sizeof(dir_path), "%s", base_path);
+    for (;;) {
+        ssize_t n = read(fd, buf, sizeof(buf));
+        if (n == 0) break;
+        if (n < 0) return DEFLATE_ERR_IO;
+        result = copy_snapshot_bytes(snapshot_fp, buf, (size_t)n, copied_bytes, total_bytes);
+        if (result != DEFLATE_OK) break;
     }
 
-    dir = opendir(dir_path);
-    if (!dir) return false;
+    return result;
+}
 
+static DeflateError snapshot_directory_posix(int dir_fd, const char *rel_path,
+                                             FileList *fl, FILE *snapshot_fp,
+                                             uint64_t *total_bytes) {
+    int enum_fd = dup(dir_fd);
+    if (enum_fd < 0) return DEFLATE_ERR_IO;
+
+    DIR *dir = fdopendir(enum_fd);
+    if (!dir) {
+        close(enum_fd);
+        return DEFLATE_ERR_IO;
+    }
+
+    struct dirent *entry;
+    DeflateError result = DEFLATE_OK;
     while ((entry = readdir(dir)) != NULL) {
-        /* Skip . and .. */
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-            continue;
-        }
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
 
-        /* Build relative path */
+        char new_rel[MAX_PATH_LEN];
         if (rel_path[0]) {
-            snprintf(new_rel, MAX_PATH_LEN, "%s/%s", rel_path, entry->d_name);
+            int written = snprintf(new_rel, sizeof(new_rel), "%s/%s", rel_path, entry->d_name);
+            if (written < 0 || (size_t)written >= sizeof(new_rel)) {
+                result = DEFLATE_ERR_PATH;
+                break;
+            }
         } else {
-            snprintf(new_rel, MAX_PATH_LEN, "%s", entry->d_name);
+            int written = snprintf(new_rel, sizeof(new_rel), "%s", entry->d_name);
+            if (written < 0 || (size_t)written >= sizeof(new_rel)) {
+                result = DEFLATE_ERR_PATH;
+                break;
+            }
         }
 
-        /* Build full path */
-        snprintf(full_path, sizeof(full_path), "%s/%s", base_path, new_rel);
+        int child_dir_fd = openat(dir_fd, entry->d_name,
+                                  O_RDONLY | O_DIRECTORY
+#ifdef O_NOFOLLOW
+                                  | O_NOFOLLOW
+#endif
+                                  );
+        if (child_dir_fd >= 0) {
+            result = snapshot_directory_posix(child_dir_fd, new_rel, fl, snapshot_fp, total_bytes);
+            close(child_dir_fd);
+            if (result != DEFLATE_OK) break;
+            continue;
+        }
+        if (errno == ELOOP) continue;
+        if (errno != ENOTDIR) {
+            result = DEFLATE_ERR_IO;
+            break;
+        }
 
-        if (lstat(full_path, &st) != 0) {
+        int file_fd = openat(dir_fd, entry->d_name,
+                             O_RDONLY
+#ifdef O_NOFOLLOW
+                             | O_NOFOLLOW
+#endif
+                             );
+        if (file_fd < 0) {
+            if (errno == ELOOP) continue;
+            result = DEFLATE_ERR_IO;
+            break;
+        }
+
+        struct stat st;
+        if (fstat(file_fd, &st) != 0) {
+            close(file_fd);
+            result = DEFLATE_ERR_IO;
+            break;
+        }
+        if (!S_ISREG(st.st_mode)) {
+            close(file_fd);
             continue;
         }
 
-        /* FIX #24: Skip symlinks — never follow into external trees */
-        if (S_ISLNK(st.st_mode)) {
-            continue;
-        }
-
-        if (S_ISDIR(st.st_mode)) {
-            /* Recurse into subdirectory */
-            if (!traverse_directory(base_path, new_rel, fl)) {
-                closedir(dir);
-                return false;
-            }
-        } else if (S_ISREG(st.st_mode)) {
-            /* Add file to list */
-            if (!filelist_add(fl, new_rel, (uint64_t)st.st_size)) {
-                closedir(dir);
-                return false;
-            }
+        uint64_t copied = 0;
+        result = snapshot_file_posix(file_fd, snapshot_fp, &copied, total_bytes);
+        close(file_fd);
+        if (result != DEFLATE_OK) break;
+        if (!filelist_add(fl, new_rel, copied)) {
+            result = DEFLATE_ERR_LIMIT;
+            break;
         }
     }
 
     closedir(dir);
-    return true;
+    return result;
 }
 #endif
+
+static DeflateError build_folder_snapshot(const char *folder_path, const char *outfile,
+                                          FileList **fl_out, char **snapshot_path_out,
+                                          uint64_t *total_bytes_out) {
+    FileList *fl = filelist_create();
+    FILE *snapshot_fp = NULL;
+    char *snapshot_path = NULL;
+    DeflateError result = DEFLATE_OK;
+
+    *fl_out = NULL;
+    *snapshot_path_out = NULL;
+    *total_bytes_out = 0;
+
+    if (!fl) return DEFLATE_ERR_MEM;
+
+    snapshot_fp = open_unique_temp_file_sibling(outfile, &snapshot_path);
+    if (!snapshot_fp) {
+        filelist_destroy(fl);
+        return DEFLATE_ERR_IO;
+    }
+
+#if PLATFORM_WINDOWS
+    result = snapshot_directory_windows(folder_path, "", fl, snapshot_fp, total_bytes_out);
+#else
+    int root_fd = open(folder_path,
+                       O_RDONLY | O_DIRECTORY
+#ifdef O_NOFOLLOW
+                       | O_NOFOLLOW
+#endif
+                       );
+    if (root_fd < 0) {
+        result = (errno == ELOOP) ? DEFLATE_ERR_PATH : DEFLATE_ERR_IO;
+    } else {
+        result = snapshot_directory_posix(root_fd, "", fl, snapshot_fp, total_bytes_out);
+        close(root_fd);
+    }
+#endif
+
+    if (fflush(snapshot_fp) != 0) result = DEFLATE_ERR_IO;
+    if (fclose(snapshot_fp) != 0 && result == DEFLATE_OK) result = DEFLATE_ERR_IO;
+    snapshot_fp = NULL;
+
+    if (result == DEFLATE_OK && fl->count == 0) {
+        result = DEFLATE_ERR_FORMAT;
+    }
+
+    if (result != DEFLATE_OK) {
+        if (snapshot_path) remove_path_if_exists(snapshot_path);
+        SAFE_FREE(snapshot_path);
+        filelist_destroy(fl);
+        return result;
+    }
+
+    *fl_out = fl;
+    *snapshot_path_out = snapshot_path;
+    return DEFLATE_OK;
+}
 
 /* ==================== PORTABLE I/O ==================== */
 
@@ -809,6 +1532,609 @@ static bool read_le64(FILE *fp, uint64_t *val) {
         *val |= ((uint64_t)buf[i] << (i * 8));
     }
     return true;
+}
+
+/* ==================== SHA-256 ==================== */
+
+static uint32_t sha256_rotr(uint32_t x, uint32_t n) {
+    return (x >> n) | (x << (32U - n));
+}
+
+static uint32_t sha256_load_be32(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) |
+           ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) |
+           (uint32_t)p[3];
+}
+
+static void sha256_store_be32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v >> 24);
+    p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);
+    p[3] = (uint8_t)v;
+}
+
+static void sha256_transform(SHA256Ctx *ctx, const uint8_t block[64]) {
+    static const uint32_t k[64] = {
+        0x428A2F98U, 0x71374491U, 0xB5C0FBCFU, 0xE9B5DBA5U,
+        0x3956C25BU, 0x59F111F1U, 0x923F82A4U, 0xAB1C5ED5U,
+        0xD807AA98U, 0x12835B01U, 0x243185BEU, 0x550C7DC3U,
+        0x72BE5D74U, 0x80DEB1FEU, 0x9BDC06A7U, 0xC19BF174U,
+        0xE49B69C1U, 0xEFBE4786U, 0x0FC19DC6U, 0x240CA1CCU,
+        0x2DE92C6FU, 0x4A7484AAU, 0x5CB0A9DCU, 0x76F988DAU,
+        0x983E5152U, 0xA831C66DU, 0xB00327C8U, 0xBF597FC7U,
+        0xC6E00BF3U, 0xD5A79147U, 0x06CA6351U, 0x14292967U,
+        0x27B70A85U, 0x2E1B2138U, 0x4D2C6DFCU, 0x53380D13U,
+        0x650A7354U, 0x766A0ABBU, 0x81C2C92EU, 0x92722C85U,
+        0xA2BFE8A1U, 0xA81A664BU, 0xC24B8B70U, 0xC76C51A3U,
+        0xD192E819U, 0xD6990624U, 0xF40E3585U, 0x106AA070U,
+        0x19A4C116U, 0x1E376C08U, 0x2748774CU, 0x34B0BCB5U,
+        0x391C0CB3U, 0x4ED8AA4AU, 0x5B9CCA4FU, 0x682E6FF3U,
+        0x748F82EEU, 0x78A5636FU, 0x84C87814U, 0x8CC70208U,
+        0x90BEFFFAU, 0xA4506CEBU, 0xBEF9A3F7U, 0xC67178F2U
+    };
+    uint32_t w[64];
+    for (int i = 0; i < 16; i++) {
+        w[i] = sha256_load_be32(block + (size_t)i * 4U);
+    }
+    for (int i = 16; i < 64; i++) {
+        uint32_t s0 = sha256_rotr(w[i - 15], 7) ^ sha256_rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+        uint32_t s1 = sha256_rotr(w[i - 2], 17) ^ sha256_rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+
+    uint32_t a = ctx->state[0], b = ctx->state[1], c = ctx->state[2], d = ctx->state[3];
+    uint32_t e = ctx->state[4], f = ctx->state[5], g = ctx->state[6], h = ctx->state[7];
+
+    for (int i = 0; i < 64; i++) {
+        uint32_t s1 = sha256_rotr(e, 6) ^ sha256_rotr(e, 11) ^ sha256_rotr(e, 25);
+        uint32_t ch = (e & f) ^ ((~e) & g);
+        uint32_t temp1 = h + s1 + ch + k[i] + w[i];
+        uint32_t s0 = sha256_rotr(a, 2) ^ sha256_rotr(a, 13) ^ sha256_rotr(a, 22);
+        uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+        uint32_t temp2 = s0 + maj;
+
+        h = g; g = f; f = e; e = d + temp1;
+        d = c; c = b; b = a; a = temp1 + temp2;
+    }
+
+    ctx->state[0] += a; ctx->state[1] += b; ctx->state[2] += c; ctx->state[3] += d;
+    ctx->state[4] += e; ctx->state[5] += f; ctx->state[6] += g; ctx->state[7] += h;
+}
+
+static void sha256_init(SHA256Ctx *ctx) {
+    static const uint32_t iv[8] = {
+        0x6A09E667U, 0xBB67AE85U, 0x3C6EF372U, 0xA54FF53AU,
+        0x510E527FU, 0x9B05688CU, 0x1F83D9ABU, 0x5BE0CD19U
+    };
+    memcpy(ctx->state, iv, sizeof(iv));
+    ctx->bit_count = 0;
+    ctx->buffer_len = 0;
+}
+
+static void sha256_update(SHA256Ctx *ctx, const uint8_t *data, size_t len) {
+    ctx->bit_count += (uint64_t)len * 8U;
+    while (len > 0) {
+        size_t take = 64U - ctx->buffer_len;
+        if (take > len) take = len;
+        memcpy(ctx->buffer + ctx->buffer_len, data, take);
+        ctx->buffer_len += take;
+        data += take;
+        len -= take;
+
+        if (ctx->buffer_len == 64U) {
+            sha256_transform(ctx, ctx->buffer);
+            ctx->buffer_len = 0;
+        }
+    }
+}
+
+static void sha256_final(SHA256Ctx *ctx, uint8_t out[32]) {
+    ctx->buffer[ctx->buffer_len++] = 0x80;
+    if (ctx->buffer_len > 56U) {
+        while (ctx->buffer_len < 64U) ctx->buffer[ctx->buffer_len++] = 0;
+        sha256_transform(ctx, ctx->buffer);
+        ctx->buffer_len = 0;
+    }
+    while (ctx->buffer_len < 56U) ctx->buffer[ctx->buffer_len++] = 0;
+
+    for (int i = 7; i >= 0; i--) {
+        ctx->buffer[ctx->buffer_len++] = (uint8_t)(ctx->bit_count >> (i * 8));
+    }
+    sha256_transform(ctx, ctx->buffer);
+
+    for (int i = 0; i < 8; i++) {
+        sha256_store_be32(out + (size_t)i * 4U, ctx->state[i]);
+    }
+}
+
+static DeflateError sha256_file(const char *path, uint8_t digest[32]) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return DEFLATE_ERR_IO;
+
+    SHA256Ctx ctx;
+    sha256_init(&ctx);
+
+    uint8_t buf[IO_BUFFER_SIZE];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
+        sha256_update(&ctx, buf, n);
+    }
+    if (ferror(fp)) {
+        fclose(fp);
+        return DEFLATE_ERR_IO;
+    }
+    fclose(fp);
+    sha256_final(&ctx, digest);
+    return DEFLATE_OK;
+}
+
+/* ==================== SIGNATURE VERIFICATION ==================== */
+
+static void bigint_zero(BigUint *a, size_t nwords) {
+    memset(a->words, 0, sizeof(uint32_t) * nwords);
+    a->nwords = nwords;
+}
+
+static void bigint_copy(BigUint *dst, const BigUint *src, size_t nwords) {
+    memcpy(dst->words, src->words, sizeof(uint32_t) * nwords);
+    dst->nwords = nwords;
+}
+
+static int bigint_cmp(const BigUint *a, const BigUint *b, size_t nwords) {
+    for (size_t i = nwords; i > 0; i--) {
+        uint32_t aw = a->words[i - 1];
+        uint32_t bw = b->words[i - 1];
+        if (aw < bw) return -1;
+        if (aw > bw) return 1;
+    }
+    return 0;
+}
+
+static void bigint_add_n(BigUint *a, const BigUint *b, size_t nwords) {
+    uint64_t carry = 0;
+    for (size_t i = 0; i < nwords; i++) {
+        uint64_t sum = (uint64_t)a->words[i] + (uint64_t)b->words[i] + carry;
+        a->words[i] = (uint32_t)sum;
+        carry = sum >> 32;
+    }
+}
+
+static void bigint_sub_n(BigUint *a, const BigUint *b, size_t nwords) {
+    uint64_t borrow = 0;
+    for (size_t i = 0; i < nwords; i++) {
+        uint64_t av = (uint64_t)a->words[i];
+        uint64_t bv = (uint64_t)b->words[i] + borrow;
+        if (av >= bv) {
+            a->words[i] = (uint32_t)(av - bv);
+            borrow = 0;
+        } else {
+            a->words[i] = (uint32_t)((1ULL << 32) + av - bv);
+            borrow = 1;
+        }
+    }
+}
+
+static bool bigint_from_bytes_be(BigUint *a, const uint8_t *buf, size_t len) {
+    size_t nwords = (len + 3U) / 4U;
+    if (nwords == 0 || nwords > RSA_MAX_WORDS) return false;
+
+    bigint_zero(a, nwords);
+    size_t pos = len;
+    for (size_t i = 0; i < nwords; i++) {
+        uint32_t word = 0;
+        for (size_t j = 0; j < 4 && pos > 0; j++) {
+            pos--;
+            word |= (uint32_t)buf[pos] << (j * 8U);
+        }
+        a->words[i] = word;
+    }
+    return true;
+}
+
+static void bigint_to_bytes_be(const BigUint *a, uint8_t *buf, size_t len) {
+    memset(buf, 0, len);
+    for (size_t i = 0; i < len; i++) {
+        size_t byte_index = len - 1U - i;
+        size_t word_index = i / 4U;
+        size_t shift = (i % 4U) * 8U;
+        if (word_index < a->nwords) {
+            buf[byte_index] = (uint8_t)(a->words[word_index] >> shift);
+        }
+    }
+}
+
+static void bigint_set_u32(BigUint *a, uint32_t value, size_t nwords) {
+    bigint_zero(a, nwords);
+    a->words[0] = value;
+}
+
+static bool bigint_get_bit(const BigUint *a, size_t bit_index) {
+    size_t word = bit_index / 32U;
+    size_t bit = bit_index % 32U;
+    if (word >= a->nwords) return false;
+    return ((a->words[word] >> bit) & 1U) != 0;
+}
+
+static void bigint_add_mod(BigUint *acc, const BigUint *b, const BigUint *mod, size_t nwords) {
+    BigUint threshold;
+    bigint_copy(&threshold, mod, nwords);
+    bigint_sub_n(&threshold, b, nwords);
+
+    if (bigint_cmp(acc, &threshold, nwords) >= 0) {
+        bigint_sub_n(acc, &threshold, nwords);
+    } else {
+        bigint_add_n(acc, b, nwords);
+    }
+}
+
+static void bigint_modmul(BigUint *out, const BigUint *a, const BigUint *b,
+                          const BigUint *mod, size_t nwords) {
+    BigUint x, res;
+    bigint_copy(&x, a, nwords);
+    bigint_zero(&res, nwords);
+
+    for (size_t bit = 0; bit < nwords * 32U; bit++) {
+        if (bigint_get_bit(b, bit)) {
+            bigint_add_mod(&res, &x, mod, nwords);
+        }
+        bigint_add_mod(&x, &x, mod, nwords);
+    }
+
+    bigint_copy(out, &res, nwords);
+}
+
+static void bigint_modexp_u32(BigUint *out, const BigUint *base, uint32_t exponent,
+                              const BigUint *mod, size_t nwords) {
+    BigUint result, power;
+    bigint_set_u32(&result, 1U, nwords);
+    bigint_copy(&power, base, nwords);
+
+    while (exponent != 0U) {
+        if ((exponent & 1U) != 0U) {
+            BigUint tmp;
+            bigint_modmul(&tmp, &result, &power, mod, nwords);
+            bigint_copy(&result, &tmp, nwords);
+        }
+        exponent >>= 1U;
+        if (exponent != 0U) {
+            BigUint tmp;
+            bigint_modmul(&tmp, &power, &power, mod, nwords);
+            bigint_copy(&power, &tmp, nwords);
+        }
+    }
+
+    bigint_copy(out, &result, nwords);
+}
+
+static int base64_value(unsigned char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    if (c == '=') return -2;
+    return -1;
+}
+
+static bool load_file_bytes(const char *path, uint8_t **out, size_t *out_len) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return false;
+
+    uint8_t *buf = NULL;
+    size_t len = 0, cap = 0;
+    uint8_t tmp[1024];
+    size_t n;
+
+    while ((n = fread(tmp, 1, sizeof(tmp), fp)) > 0) {
+        if (len > SIZE_MAX - n) {
+            free(buf);
+            fclose(fp);
+            return false;
+        }
+        if (len + n > cap) {
+            size_t new_cap = cap ? cap * 2U : 2048U;
+            while (new_cap < len + n) new_cap *= 2U;
+            uint8_t *new_buf = realloc(buf, new_cap);
+            if (!new_buf) {
+                free(buf);
+                fclose(fp);
+                return false;
+            }
+            buf = new_buf;
+            cap = new_cap;
+        }
+        memcpy(buf + len, tmp, n);
+        len += n;
+    }
+    if (ferror(fp)) {
+        free(buf);
+        fclose(fp);
+        return false;
+    }
+    fclose(fp);
+
+    *out = buf;
+    *out_len = len;
+    return true;
+}
+
+static bool decode_pem_block(const uint8_t *data, size_t len,
+                             const char *label, uint8_t **der, size_t *der_len) {
+    size_t header_len = strlen(label) + 17U;
+    size_t footer_len = strlen(label) + 15U;
+    char *header = malloc(header_len + 1U);
+    char *footer = malloc(footer_len + 1U);
+    char *text = malloc(len + 1U);
+    if (!header || !footer || !text) {
+        free(header); free(footer); free(text);
+        return false;
+    }
+
+    snprintf(header, header_len + 1U, "-----BEGIN %s-----", label);
+    snprintf(footer, footer_len + 1U, "-----END %s-----", label);
+    memcpy(text, data, len);
+    text[len] = '\0';
+
+    char *start = strstr(text, header);
+    if (!start) {
+        free(header); free(footer); free(text);
+        return false;
+    }
+    start += strlen(header);
+    char *end = strstr(start, footer);
+    if (!end) {
+        free(header); free(footer); free(text);
+        return false;
+    }
+
+    size_t cap = ((size_t)(end - start) / 4U + 1U) * 3U;
+    uint8_t *out = malloc(cap ? cap : 1U);
+    if (!out) {
+        free(header); free(footer); free(text);
+        return false;
+    }
+
+    size_t out_pos = 0;
+    int vals[4];
+    int have = 0;
+    for (char *p = start; p < end; p++) {
+        unsigned char ch = (unsigned char)*p;
+        if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') continue;
+
+        int v = base64_value(ch);
+        if (v < -1) {
+            vals[have++] = v;
+        } else if (v >= 0) {
+            vals[have++] = v;
+        } else {
+            free(out); free(header); free(footer); free(text);
+            return false;
+        }
+
+        if (have == 4) {
+            if (vals[0] < 0 || vals[1] < 0) {
+                free(out); free(header); free(footer); free(text);
+                return false;
+            }
+            out[out_pos++] = (uint8_t)((vals[0] << 2) | (vals[1] >> 4));
+            if (vals[2] != -2) {
+                if (vals[2] < 0) {
+                    free(out); free(header); free(footer); free(text);
+                    return false;
+                }
+                out[out_pos++] = (uint8_t)(((vals[1] & 0x0F) << 4) | (vals[2] >> 2));
+                if (vals[3] != -2) {
+                    if (vals[3] < 0) {
+                        free(out); free(header); free(footer); free(text);
+                        return false;
+                    }
+                    out[out_pos++] = (uint8_t)(((vals[2] & 0x03) << 6) | vals[3]);
+                }
+            }
+            have = 0;
+        }
+    }
+
+    free(header); free(footer); free(text);
+    if (have != 0) {
+        free(out);
+        return false;
+    }
+
+    *der = out;
+    *der_len = out_pos;
+    return true;
+}
+
+static bool der_read_length(const uint8_t *buf, size_t len, size_t *off, size_t *out_len) {
+    if (*off >= len) return false;
+    uint8_t first = buf[(*off)++];
+    if ((first & 0x80U) == 0) {
+        *out_len = first;
+        return *off + *out_len <= len;
+    }
+
+    size_t count = first & 0x7FU;
+    if (count == 0 || count > sizeof(size_t) || *off + count > len) return false;
+    size_t v = 0;
+    for (size_t i = 0; i < count; i++) {
+        v = (v << 8) | buf[(*off)++];
+    }
+    if (*off + v > len) return false;
+    *out_len = v;
+    return true;
+}
+
+static bool der_expect_tag(const uint8_t *buf, size_t len, size_t *off,
+                           uint8_t tag, const uint8_t **val, size_t *val_len) {
+    if (*off >= len || buf[*off] != tag) return false;
+    (*off)++;
+    if (!der_read_length(buf, len, off, val_len)) return false;
+    *val = buf + *off;
+    *off += *val_len;
+    return true;
+}
+
+static bool parse_rsa_public_key_pkcs1(const uint8_t *der, size_t der_len, RsaPublicKey *key) {
+    size_t off = 0;
+    const uint8_t *seq;
+    size_t seq_len;
+    if (!der_expect_tag(der, der_len, &off, 0x30, &seq, &seq_len) || off != der_len) return false;
+
+    size_t s_off = 0;
+    const uint8_t *mod_bytes, *exp_bytes;
+    size_t mod_len, exp_len;
+    if (!der_expect_tag(seq, seq_len, &s_off, 0x02, &mod_bytes, &mod_len)) return false;
+    if (!der_expect_tag(seq, seq_len, &s_off, 0x02, &exp_bytes, &exp_len)) return false;
+    if (s_off != seq_len || mod_len == 0 || exp_len == 0) return false;
+    if ((mod_bytes[0] & 0x80U) != 0 || (exp_bytes[0] & 0x80U) != 0) return false;
+
+    while (mod_len > 0 && mod_bytes[0] == 0x00) { mod_bytes++; mod_len--; }
+    while (exp_len > 0 && exp_bytes[0] == 0x00) { exp_bytes++; exp_len--; }
+    if (mod_len == 0 || exp_len == 0 || mod_len > (RSA_MAX_BITS / 8U)) return false;
+
+    if (exp_len > 4U) return false;
+    uint32_t exponent = 0;
+    for (size_t i = 0; i < exp_len; i++) {
+        exponent = (exponent << 8) | exp_bytes[i];
+    }
+    if (exponent < 3U || (exponent & 1U) == 0) return false;
+
+    if (!bigint_from_bytes_be(&key->modulus, mod_bytes, mod_len)) return false;
+    key->exponent = exponent;
+    key->modulus_len = mod_len;
+    return true;
+}
+
+static bool parse_rsa_public_key_spki(const uint8_t *der, size_t der_len, RsaPublicKey *key) {
+    static const uint8_t rsa_oid[] = {0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x01,0x01};
+    size_t off = 0;
+    const uint8_t *outer;
+    size_t outer_len;
+    if (!der_expect_tag(der, der_len, &off, 0x30, &outer, &outer_len) || off != der_len) return false;
+
+    size_t o_off = 0;
+    const uint8_t *alg_seq, *bitstr;
+    size_t alg_len, bitstr_len;
+    if (!der_expect_tag(outer, outer_len, &o_off, 0x30, &alg_seq, &alg_len)) return false;
+    if (!der_expect_tag(outer, outer_len, &o_off, 0x03, &bitstr, &bitstr_len)) return false;
+    if (o_off != outer_len || bitstr_len < 1U || bitstr[0] != 0x00) return false;
+
+    size_t a_off = 0;
+    const uint8_t *oid;
+    size_t oid_len;
+    if (!der_expect_tag(alg_seq, alg_len, &a_off, 0x06, &oid, &oid_len)) return false;
+    if (oid_len != sizeof(rsa_oid) || memcmp(oid, rsa_oid, sizeof(rsa_oid)) != 0) return false;
+    if (a_off < alg_len) {
+        const uint8_t *nullv;
+        size_t null_len;
+        if (!der_expect_tag(alg_seq, alg_len, &a_off, 0x05, &nullv, &null_len) || null_len != 0) {
+            return false;
+        }
+    }
+    if (a_off != alg_len) return false;
+
+    return parse_rsa_public_key_pkcs1(bitstr + 1U, bitstr_len - 1U, key);
+}
+
+static bool load_rsa_public_key(const char *path, RsaPublicKey *key) {
+    uint8_t *raw = NULL;
+    size_t raw_len = 0;
+    if (!load_file_bytes(path, &raw, &raw_len)) return false;
+
+    uint8_t *der = NULL;
+    size_t der_len = 0;
+    bool ok = false;
+
+    if (raw_len > 0 && raw[0] == 0x30) {
+        der = raw;
+        der_len = raw_len;
+        ok = parse_rsa_public_key_spki(der, der_len, key) ||
+             parse_rsa_public_key_pkcs1(der, der_len, key);
+        raw = NULL;
+    } else {
+        if (decode_pem_block(raw, raw_len, "PUBLIC KEY", &der, &der_len) ||
+            decode_pem_block(raw, raw_len, "RSA PUBLIC KEY", &der, &der_len)) {
+            ok = parse_rsa_public_key_spki(der, der_len, key) ||
+                 parse_rsa_public_key_pkcs1(der, der_len, key);
+        }
+    }
+
+    free(raw);
+    free(der);
+    return ok;
+}
+
+static bool verify_pkcs1_v15_sha256_em(const uint8_t *em, size_t em_len,
+                                       const uint8_t digest[32]) {
+    static const uint8_t prefix[] = {
+        0x30,0x31,0x30,0x0D,0x06,0x09,0x60,0x86,0x48,0x01,0x65,0x03,
+        0x04,0x02,0x01,0x05,0x00,0x04,0x20
+    };
+    size_t t_len = sizeof(prefix) + 32U;
+    if (em_len < t_len + 11U) return false;
+    if (em[0] != 0x00 || em[1] != 0x01) return false;
+
+    size_t i = 2;
+    while (i < em_len && em[i] == 0xFF) i++;
+    if (i < 10U || i >= em_len || em[i] != 0x00) return false;
+    i++;
+    if (em_len - i != t_len) return false;
+    if (memcmp(em + i, prefix, sizeof(prefix)) != 0) return false;
+    return memcmp(em + i + sizeof(prefix), digest, 32U) == 0;
+}
+
+static DeflateError verify_archive_signature(const char *archive_path,
+                                             const char *sig_path,
+                                             const char *pubkey_path) {
+    RsaPublicKey key;
+    memset(&key, 0, sizeof(key));
+    if (!load_rsa_public_key(pubkey_path, &key)) {
+        LOG_ERR("Error: Failed to parse RSA public key\n");
+        return DEFLATE_ERR_AUTH;
+    }
+
+    uint8_t *sig = NULL;
+    size_t sig_len = 0;
+    if (!load_file_bytes(sig_path, &sig, &sig_len)) {
+        LOG_ERR("Error: Failed to read signature file\n");
+        return DEFLATE_ERR_AUTH;
+    }
+    if (sig_len != key.modulus_len) {
+        free(sig);
+        LOG_ERR("Error: Signature length does not match RSA modulus\n");
+        return DEFLATE_ERR_AUTH;
+    }
+
+    BigUint sig_int;
+    if (!bigint_from_bytes_be(&sig_int, sig, sig_len) ||
+        bigint_cmp(&sig_int, &key.modulus, key.modulus.nwords) >= 0) {
+        free(sig);
+        LOG_ERR("Error: Signature integer is out of range\n");
+        return DEFLATE_ERR_AUTH;
+    }
+    free(sig);
+
+    uint8_t digest[32];
+    DeflateError err = sha256_file(archive_path, digest);
+    if (err != DEFLATE_OK) {
+        LOG_ERR("Error: Failed to hash archive for signature verification\n");
+        return DEFLATE_ERR_AUTH;
+    }
+
+    BigUint em_int;
+    bigint_modexp_u32(&em_int, &sig_int, key.exponent, &key.modulus, key.modulus.nwords);
+
+    uint8_t em[(RSA_MAX_BITS / 8)];
+    bigint_to_bytes_be(&em_int, em, key.modulus_len);
+    if (!verify_pkcs1_v15_sha256_em(em, key.modulus_len, digest)) {
+        LOG_ERR("Error: Signature verification failed\n");
+        return DEFLATE_ERR_AUTH;
+    }
+
+    LOG_NORMAL_MSG("Signature Verified\n");
+    return DEFLATE_OK;
 }
 
 /* ==================== CRC32 (Slice-by-4 Optimized) ==================== */
@@ -1349,6 +2675,9 @@ cleanup:
     return result;
 }
 
+static bool validate_canonical_entries(const CanonicalEntry *table, int32_t t_count,
+                                       bool require_eob);
+
 static DeflateError encode_block(DeflateContext *ctx, BitStream *bs,
                                  int32_t token_count, bool is_last) {
     uint64_t freqs[SYMBOL_COUNT] = {0};
@@ -1365,6 +2694,17 @@ static DeflateError encode_block(DeflateContext *ctx, BitStream *bs,
 
     DeflateError err = build_huffman_codes(freqs, table, depths, &max_sym);
     if (err != DEFLATE_OK) return err;
+
+    {
+        CanonicalEntry compact[SYMBOL_COUNT];
+        int32_t t_count = 0;
+        for (int32_t i = 0; i <= max_sym; i++) {
+            if (table[i].len > 0) compact[t_count++] = table[i];
+        }
+        if (!validate_canonical_entries(compact, t_count, true)) {
+            return DEFLATE_ERR_FORMAT;
+        }
+    }
 
     DBG_ASSERT(max_sym < SYMBOL_COUNT);
     if (max_sym >= SYMBOL_COUNT) return DEFLATE_ERR_FORMAT;
@@ -1422,6 +2762,10 @@ static DeflateError build_fast_decode_table(FastDecodeEntry *decode_table,
         for (int32_t j = 0; j < fill_count; j++) {
             uint32_t idx = base + (uint32_t)j;
             if (idx >= FAST_DECODE_SIZE) return DEFLATE_ERR_FORMAT;
+            if (decode_table[idx].bits_used != 0 &&
+                (decode_table[idx].bits_used != len || decode_table[idx].symbol != table[i].sym)) {
+                return DEFLATE_ERR_FORMAT;
+            }
             decode_table[idx].symbol = table[i].sym;
             decode_table[idx].bits_used = len;
         }
@@ -1483,6 +2827,40 @@ static bool validate_huffman_lengths(const int32_t *bl_count, int32_t max_bits) 
     return left == 0 || (left == 1 && total_codes == 1);
 }
 
+static bool validate_canonical_entries(const CanonicalEntry *table, int32_t t_count,
+                                       bool require_eob) {
+    bool seen_symbols[SYMBOL_COUNT] = {false};
+    bool has_eob = false;
+
+    for (int32_t i = 0; i < t_count; i++) {
+        if (table[i].sym >= SYMBOL_COUNT) return false;
+        if (table[i].len == 0 || table[i].len > MAX_HUFFMAN_DEPTH) return false;
+        if (table[i].code >= (1U << table[i].len)) return false;
+        if (seen_symbols[table[i].sym]) return false;
+        seen_symbols[table[i].sym] = true;
+        if (table[i].sym == 256) has_eob = true;
+    }
+
+    for (int32_t i = 0; i < t_count; i++) {
+        for (int32_t j = i + 1; j < t_count; j++) {
+            uint16_t code_a = table[i].code;
+            uint16_t code_b = table[j].code;
+            uint8_t len_a = table[i].len;
+            uint8_t len_b = table[j].len;
+
+            if (len_a == len_b && code_a == code_b) return false;
+
+            if (len_a < len_b) {
+                if ((code_b >> (len_b - len_a)) == code_a) return false;
+            } else if (len_b < len_a) {
+                if ((code_a >> (len_a - len_b)) == code_b) return false;
+            }
+        }
+    }
+
+    return !require_eob || has_eob;
+}
+
 /* ==================== PATH SECURITY ==================== */
 
 /**
@@ -1499,6 +2877,32 @@ static bool is_valid_host_path(const char *path) {
     return true;
 }
 
+#if PLATFORM_WINDOWS
+static bool is_reserved_windows_component(const char *comp, size_t comp_len) {
+    char base[6];
+    size_t base_len = 0;
+
+    while (base_len < comp_len && comp[base_len] != '.' && base_len < sizeof(base) - 1) {
+        base[base_len] = (char)ascii_toupper_uc((unsigned char)comp[base_len]);
+        base_len++;
+    }
+    base[base_len] = '\0';
+
+    if (base_len == 0) return false;
+    if (strcmp(base, "CON") == 0 || strcmp(base, "PRN") == 0 ||
+        strcmp(base, "AUX") == 0 || strcmp(base, "NUL") == 0) {
+        return true;
+    }
+    if (base_len == 4 &&
+        ((memcmp(base, "COM", 3) == 0) || (memcmp(base, "LPT", 3) == 0)) &&
+        base[3] >= '1' && base[3] <= '9') {
+        return true;
+    }
+
+    return false;
+}
+#endif
+
 static bool is_safe_archive_path(const char *path) {
     if (!path || !path[0]) return false;
 
@@ -1511,6 +2915,7 @@ static bool is_safe_archive_path(const char *path) {
     if (check[0] == '.' && (check[1] == '/' || check[1] == '\\')) {
         check += 2;
     }
+    if (*check == '\0') return false;
 
     /* FIX #23: Component-wise validation (rejects ".." components, allows "file..txt") */
     const char *p = check;
@@ -1519,12 +2924,20 @@ static bool is_safe_archive_path(const char *path) {
         while (*end && *end != '/' && *end != '\\') end++;
         size_t comp_len = (size_t)(end - p);
 
+        if (comp_len == 0) return false;
+        if (comp_len == 1 && p[0] == '.') return false;
         if (comp_len == 2 && p[0] == '.' && p[1] == '.') return false;
 
         for (const char *c = p; c < end; c++) {
             if (*c < 32 || *c == '<' || *c == '>' || *c == '|' || *c == '"' || *c == ':')
                 return false;
         }
+
+#if PLATFORM_WINDOWS
+        if (p[comp_len - 1] == ' ' || p[comp_len - 1] == '.') return false;
+        if (is_reserved_windows_component(p, comp_len)) return false;
+#endif
+
         p = *end ? end + 1 : end;
     }
 
@@ -1598,6 +3011,31 @@ static bool should_emit_literal_for_better_match(const DeflateContext *ctx,
     (void)next_match_pos;
 
     return next_match_len > match_len;
+}
+
+static int snapshot_read_byte(FILE *fp, const FileList *fl,
+                              uint32_t *current_file, uint64_t *current_file_remaining,
+                              bool *boundary_crossed, bool *read_error) {
+    *boundary_crossed = false;
+    *read_error = false;
+
+    while (*current_file < fl->count && *current_file_remaining == 0) {
+        (*current_file)++;
+        if (*current_file >= fl->count) return EOF;
+        *current_file_remaining = fl->entries[*current_file].size;
+        *boundary_crossed = true;
+    }
+
+    if (*current_file >= fl->count) return EOF;
+
+    int c = FAST_GETC(fp);
+    if (c == EOF) {
+        *read_error = true;
+        return EOF;
+    }
+
+    (*current_file_remaining)--;
+    return c;
 }
 
 /**
@@ -1832,34 +3270,38 @@ static DeflateError compress_folder(const char *folder_path, const char *outfile
     DeflateContext *ctx = NULL;
     FileList *fl = NULL;
     DeflateError result = DEFLATE_OK;
+    char *snapshot_path = NULL;
+    uint64_t total_bytes_in = 0;
 
     if (!is_valid_host_path(folder_path) || !is_valid_host_path(outfile)) {
         LOG_ERR("Error: Invalid output path\n");
         return DEFLATE_ERR_PATH;
     }
 
-    /* Traverse directory and collect files */
-    fl = filelist_create();
-    if (!fl) {
-        LOG_ERR("Error: Memory allocation failed\n");
-        return DEFLATE_ERR_MEM;
-    }
-
-    LOG_NORMAL_MSG("Scanning directory '%s'...\n", folder_path);
-    if (!traverse_directory(folder_path, "", fl)) {
-        LOG_ERR("Error: Failed to traverse directory\n");
-        filelist_destroy(fl);
-        return DEFLATE_ERR_IO;
-    }
-
-    if (fl->count == 0) {
-        LOG_ERR("Error: No files found in directory\n");
-        filelist_destroy(fl);
-        return DEFLATE_ERR_FORMAT;
+    LOG_NORMAL_MSG("Snapshotting directory '%s'...\n", folder_path);
+    result = build_folder_snapshot(folder_path, outfile, &fl, &snapshot_path, &total_bytes_in);
+    if (result != DEFLATE_OK) {
+        if (result == DEFLATE_ERR_FORMAT) {
+            LOG_ERR("Error: No files found in directory\n");
+        } else if (result == DEFLATE_ERR_PATH) {
+            LOG_ERR("Error: Failed to snapshot directory safely\n");
+        } else if (result == DEFLATE_ERR_LIMIT) {
+            /* message already emitted */
+        } else {
+            LOG_ERR("Error: Failed to snapshot directory\n");
+        }
+        return result;
     }
 
     LOG_NORMAL_MSG("Found %u files to compress%s\n", fl->count,
                    g_solid_mode ? " (solid mode)" : "");
+
+    in = secure_fopen_read(snapshot_path);
+    if (!in) {
+        perror("Error opening snapshot input");
+        result = DEFLATE_ERR_IO;
+        goto folder_compress_cleanup;
+    }
 
     /* Open output file */
     bool is_symlink = false;
@@ -1917,96 +3359,44 @@ static DeflateError compress_folder(const char *folder_path, const char *outfile
     int32_t bytes_in_window = 0;
     int32_t match_pos = 0, match_len = 0;
     uint32_t crc = 0;
-    uint64_t total_bytes_in = 0;
     uint32_t current_file = 0;
-    uint64_t current_file_remaining = 0;
-    char full_path[MAX_PATH_LEN * 2 + 2];
-    bool file_boundary_crossed = false;
+    uint64_t current_file_remaining = fl->entries[0].size;
 
-    /* Process all files */
+    LOG_VERBOSE_MSG("  Compressing: %s (%llu bytes)\n",
+                    fl->entries[0].path,
+                    (unsigned long long)fl->entries[0].size);
+
+    /* Process snapshot stream across file boundaries */
     while (current_file < fl->count || bytes_in_window > 0) {
-        /* Open next file if needed */
-        if (!in && current_file < fl->count) {
-            result = join_path_checked(full_path, sizeof(full_path), folder_path,
-                                       fl->entries[current_file].path);
-            if (result != DEFLATE_OK) goto folder_compress_cleanup;
-
-            in = secure_fopen_read(full_path);
-            if (!in) {
-                LOG_ERR("Error: Cannot open file '%s'\n", full_path);
-                result = DEFLATE_ERR_IO;
-                goto folder_compress_cleanup;
-            }
-            current_file_remaining = fl->entries[current_file].size;
-            LOG_VERBOSE_MSG("  Compressing: %s (%llu bytes)\n",
-                   fl->entries[current_file].path,
-                   (unsigned long long)current_file_remaining);
-
-            /* In non-solid mode, reset hash heads on file boundary (but keep window data) */
-            if (!g_solid_mode && file_boundary_crossed) {
-                memset(ctx->hash_chain.head, 0xFF, sizeof(ctx->hash_chain.head));
-            }
-            file_boundary_crossed = false;
-        }
-
         /* Fill window with data from current/next files */
-        while (bytes_in_window < MAX_MATCH && (in || current_file < fl->count)) {
-            int c = EOF;
+        while (bytes_in_window < MAX_MATCH && current_file < fl->count) {
+            bool read_error = false;
+            bool crossed = false;
+            int c = snapshot_read_byte(in, fl, &current_file, &current_file_remaining,
+                                       &crossed, &read_error);
 
-            if (in) {
-                c = FAST_GETC(in);
-                if (c != EOF) {
-                    current_file_remaining--;
+            if (crossed) {
+                LOG_VERBOSE_MSG("  Compressing: %s (%llu bytes)\n",
+                                fl->entries[current_file].path,
+                                (unsigned long long)fl->entries[current_file].size);
+                if (!g_solid_mode) {
+                    memset(ctx->hash_chain.head, 0xFF, sizeof(ctx->hash_chain.head));
                 }
             }
 
             if (c == EOF) {
-                /* End of current file, move to next */
-                if (in) {
-                    fclose(in);
-                    in = NULL;
-                    current_file++;
-                    file_boundary_crossed = true;
+                if (read_error) {
+                    LOG_ERR("Error: Snapshot stream truncated unexpectedly\n");
+                    result = DEFLATE_ERR_IO;
+                    goto folder_compress_cleanup;
                 }
-
-                /* Open next file */
-                if (current_file < fl->count) {
-                    result = join_path_checked(full_path, sizeof(full_path), folder_path,
-                                               fl->entries[current_file].path);
-                    if (result != DEFLATE_OK) goto folder_compress_cleanup;
-
-                    in = secure_fopen_read(full_path);
-                    if (!in) {
-                        LOG_ERR("Error: Cannot open file '%s'\n", full_path);
-                        result = DEFLATE_ERR_IO;
-                        goto folder_compress_cleanup;
-                    }
-                    current_file_remaining = fl->entries[current_file].size;
-                    LOG_VERBOSE_MSG("  Compressing: %s (%llu bytes)\n",
-                           fl->entries[current_file].path,
-                           (unsigned long long)current_file_remaining);
-
-                    if (!g_solid_mode) {
-                        memset(ctx->hash_chain.head, 0xFF, sizeof(ctx->hash_chain.head));
-                    }
-                    continue;
-                } else {
-                    break;
-                }
+                break;
             }
 
             ctx->window[write_pos] = (uint8_t)c;
             ctx->window[write_pos + WINDOW_SIZE] = (uint8_t)c;
             write_pos = (write_pos + 1) & WINDOW_MASK;
             bytes_in_window++;
-            total_bytes_in++;
-
-            if (total_bytes_in > MAX_INPUT_SIZE) {
-                LOG_ERR("Error: Total input exceeds %llu byte limit\n",
-                        (unsigned long long)MAX_INPUT_SIZE);
-                result = DEFLATE_ERR_LIMIT;
-                goto folder_compress_cleanup;
-            }
         }
 
         if (bytes_in_window == 0) break;
@@ -2037,39 +3427,17 @@ static DeflateError compress_folder(const char *folder_path, const char *outfile
             /* Advance by match_len bytes, refilling from files */
             int32_t advance = match_len;
             for (int32_t i = 0; i < advance; i++) {
-                int c = EOF;
+                bool read_error = false;
+                bool crossed = false;
+                int c = snapshot_read_byte(in, fl, &current_file, &current_file_remaining,
+                                           &crossed, &read_error);
 
-                /* Try to read from current file */
-                if (in) {
-                    c = FAST_GETC(in);
-                    if (c != EOF) current_file_remaining--;
-                }
-
-                if (c == EOF && in) {
-                    fclose(in);
-                    in = NULL;
-                    current_file++;
-                    file_boundary_crossed = true;
-
-                    /* Open next file */
-                    if (current_file < fl->count) {
-                        result = join_path_checked(full_path, sizeof(full_path), folder_path,
-                                                   fl->entries[current_file].path);
-                        if (result != DEFLATE_OK) goto folder_compress_cleanup;
-                        in = secure_fopen_read(full_path);
-                        if (in) {
-                            current_file_remaining = fl->entries[current_file].size;
-                            LOG_VERBOSE_MSG("  Compressing: %s (%llu bytes)\n",
-                                   fl->entries[current_file].path,
-                                   (unsigned long long)current_file_remaining);
-
-                            if (!g_solid_mode) {
-                                memset(ctx->hash_chain.head, 0xFF, sizeof(ctx->hash_chain.head));
-                            }
-
-                            c = FAST_GETC(in);
-                            if (c != EOF) current_file_remaining--;
-                        }
+                if (crossed) {
+                    LOG_VERBOSE_MSG("  Compressing: %s (%llu bytes)\n",
+                                    fl->entries[current_file].path,
+                                    (unsigned long long)fl->entries[current_file].size);
+                    if (!g_solid_mode) {
+                        memset(ctx->hash_chain.head, 0xFF, sizeof(ctx->hash_chain.head));
                     }
                 }
 
@@ -2077,15 +3445,12 @@ static DeflateError compress_folder(const char *folder_path, const char *outfile
                     ctx->window[write_pos] = (uint8_t)c;
                     ctx->window[write_pos + WINDOW_SIZE] = (uint8_t)c;
                     write_pos = (write_pos + 1) & WINDOW_MASK;
-                    total_bytes_in++;
-
-                    if (total_bytes_in > MAX_INPUT_SIZE) {
-                        LOG_ERR("Error: Total input exceeds %llu byte limit\n",
-                                (unsigned long long)MAX_INPUT_SIZE);
-                        result = DEFLATE_ERR_LIMIT;
+                } else {
+                    if (read_error) {
+                        LOG_ERR("Error: Snapshot stream truncated unexpectedly\n");
+                        result = DEFLATE_ERR_IO;
                         goto folder_compress_cleanup;
                     }
-                } else {
                     bytes_in_window--;
                 }
 
@@ -2149,6 +3514,10 @@ folder_compress_cleanup:
     }
     if (in) fclose(in);
     if (out) fclose(out);
+    if (snapshot_path) {
+        remove_path_if_exists(snapshot_path);
+        SAFE_FREE(snapshot_path);
+    }
     filelist_destroy(fl);
     return result;
 }
@@ -2160,6 +3529,8 @@ static DeflateError decompress_file(const char *infile, const char *outfile) {
     FILE *out = NULL;
     DeflateContext *ctx = NULL;
     DeflateError result = DEFLATE_OK;
+    char *temp_out = NULL;
+    bool output_committed = false;
 
     if (!is_valid_host_path(infile) || !is_valid_host_path(outfile)) {
         LOG_ERR("Error: Invalid file path\n");
@@ -2178,24 +3549,28 @@ static DeflateError decompress_file(const char *infile, const char *outfile) {
         return DEFLATE_ERR_IO;
     }
 
-    /* FIX #17: Secure file open - refuse to follow symlinks */
-    bool is_symlink = false;
-    out = secure_fopen_write(outfile, &is_symlink);
-    if (!out) {
-        if (is_symlink) {
-            LOG_ERR("Error: Output path is a symlink (security risk)\n");
-            fclose(in);
-            return DEFLATE_ERR_PATH;
-        }
-        perror("Error opening output");
-        fclose(in);
-        return DEFLATE_ERR_IO;
-    }
-
     uint32_t magic;
     if (!read_le32(in, &magic) || magic != SIG_MAGIC) {
         LOG_ERR("Error: Invalid file format\n");
         result = DEFLATE_ERR_FORMAT;
+        goto decompress_cleanup;
+    }
+
+    if (path_is_symlink(outfile)) {
+        LOG_ERR("Error: Output path is a symlink (security risk)\n");
+        result = DEFLATE_ERR_PATH;
+        goto decompress_cleanup;
+    }
+    if (path_exists(outfile) && path_is_directory_nofollow(outfile)) {
+        LOG_ERR("Error: Output path is a directory\n");
+        result = DEFLATE_ERR_PATH;
+        goto decompress_cleanup;
+    }
+
+    out = open_unique_temp_file_sibling(outfile, &temp_out);
+    if (!out) {
+        perror("Error opening output");
+        result = DEFLATE_ERR_IO;
         goto decompress_cleanup;
     }
 
@@ -2295,6 +3670,12 @@ static DeflateError decompress_file(const char *infile, const char *outfile) {
             }
         }
 
+        if (!validate_canonical_entries(table, t_count, true)) {
+            LOG_ERR("Error: Invalid canonical Huffman table\n");
+            result = DEFLATE_ERR_CORRUPT;
+            goto decompress_cleanup;
+        }
+
         if (build_fast_decode_table(ctx->decode_table, table, t_count) != DEFLATE_OK) {
             result = DEFLATE_ERR_CORRUPT;
             goto decompress_cleanup;
@@ -2320,6 +3701,11 @@ static DeflateError decompress_file(const char *infile, const char *outfile) {
 
                 uint8_t b = (uint8_t)sym;
                 wbuf_put(&wb, b);
+                if (wb.error) {
+                    LOG_ERR("Error: Write failed during decompression\n");
+                    result = DEFLATE_ERR_IO;
+                    goto decompress_cleanup;
+                }
                 calc_crc = update_crc32(&ctx->crc_tables, calc_crc, &b, 1);
                 ctx->decomp_window[window_pos] = b;
                 window_pos = (window_pos + 1) & WINDOW_MASK;
@@ -2367,6 +3753,11 @@ static DeflateError decompress_file(const char *infile, const char *outfile) {
                 for (int32_t i = 0; i < len; i++) {
                     uint8_t c = ctx->decomp_window[(src + i) & WINDOW_MASK];
                     wbuf_put(&wb, c);
+                    if (wb.error) {
+                        LOG_ERR("Error: Write failed during decompression\n");
+                        result = DEFLATE_ERR_IO;
+                        goto decompress_cleanup;
+                    }
                     ctx->decomp_window[window_pos] = c;
                     window_pos = (window_pos + 1) & WINDOW_MASK;
                 }
@@ -2408,6 +3799,27 @@ static DeflateError decompress_file(const char *infile, const char *outfile) {
         goto decompress_cleanup;
     }
 
+    if (bs_has_trailing_data(&bs)) {
+        LOG_ERR("Error: Trailing data after CRC footer\n");
+        result = DEFLATE_ERR_CORRUPT;
+        goto decompress_cleanup;
+    }
+
+    if (fclose(out) != 0) {
+        out = NULL;
+        LOG_ERR("Error: Failed to finalize output file\n");
+        result = DEFLATE_ERR_IO;
+        goto decompress_cleanup;
+    }
+    out = NULL;
+
+    if (!rename_path_atomic(temp_out, outfile, true)) {
+        perror("Error finalizing output");
+        result = DEFLATE_ERR_IO;
+        goto decompress_cleanup;
+    }
+    output_committed = true;
+
     LOG_VERBOSE_MSG("Integrity Verified: OK\n");
 
 decompress_cleanup:
@@ -2418,6 +3830,10 @@ decompress_cleanup:
     }
     if (in) fclose(in);
     if (out) fclose(out);
+    if (temp_out && !output_committed) {
+        remove_path_if_exists(temp_out);
+    }
+    SAFE_FREE(temp_out);
     return result;
 }
 
@@ -2505,6 +3921,9 @@ static DeflateError decompress_folder(const char *infile, const char *out_dir, b
     DeflateContext *ctx = NULL;
     FileList *fl = NULL;
     DeflateError result = DEFLATE_OK;
+    char *stage_dir = NULL;
+    bool output_dir_exists = false;
+    bool stage_committed = false;
 
     if (!is_valid_host_path(infile) || !is_valid_host_path(out_dir)) {
         LOG_ERR("Error: Invalid path\n");
@@ -2580,6 +3999,8 @@ static DeflateError decompress_folder(const char *infile, const char *out_dir, b
             goto folder_decompress_cleanup;
         }
 
+        normalize_path(path);
+
         if (size > MAX_OUTPUT_SIZE || expected_total > MAX_OUTPUT_SIZE - size) {
             LOG_ERR("Error: Declared output exceeds %llu byte limit\n",
                     (unsigned long long)MAX_OUTPUT_SIZE);
@@ -2595,9 +4016,15 @@ static DeflateError decompress_folder(const char *infile, const char *out_dir, b
         }
     }
 
-    /* Create output directory */
-    if (!create_directory_recursive(out_dir)) {
-        LOG_VERBOSE_MSG("Warning: Could not create output directory (may already exist)\n");
+    result = ensure_unique_archive_paths(fl);
+    if (result != DEFLATE_OK) {
+        LOG_ERR("Error: Archive contains duplicate output paths\n");
+        goto folder_decompress_cleanup;
+    }
+
+    result = prepare_output_stage_directory(out_dir, &stage_dir, &output_dir_exists);
+    if (result != DEFLATE_OK) {
+        goto folder_decompress_cleanup;
     }
 
     /* Initialize decompression context */
@@ -2632,7 +4059,7 @@ static DeflateError decompress_folder(const char *infile, const char *out_dir, b
 
     if (file_count > 0) {
         bool is_symlink = false;
-        out = secure_extract_open(out_dir, fl->entries[0].path, &is_symlink);
+        out = secure_extract_open(stage_dir, fl->entries[0].path, &is_symlink);
         if (!out) {
             LOG_ERR("Error: Cannot create '%s'%s\n", fl->entries[0].path,
                     is_symlink ? " (symlink in path)" : "");
@@ -2712,6 +4139,11 @@ static DeflateError decompress_folder(const char *infile, const char *out_dir, b
             }
         }
 
+        if (!validate_canonical_entries(table, t_count, true)) {
+            result = DEFLATE_ERR_CORRUPT;
+            goto folder_decompress_cleanup;
+        }
+
         if (build_fast_decode_table(ctx->decode_table, table, t_count) != DEFLATE_OK) {
             result = DEFLATE_ERR_CORRUPT;
             goto folder_decompress_cleanup;
@@ -2728,7 +4160,7 @@ static DeflateError decompress_folder(const char *infile, const char *out_dir, b
 
             if (sym < 257) {
                 uint8_t b = (uint8_t)sym;
-                result = folder_emit_decoded_byte(ctx, &out, &wb, out_dir, fl,
+                result = folder_emit_decoded_byte(ctx, &out, &wb, stage_dir, fl,
                                                   &current_file, &current_file_written,
                                                   &window_pos, &calc_crc, &total_output,
                                                   expected_total, b);
@@ -2779,7 +4211,7 @@ static DeflateError decompress_folder(const char *infile, const char *out_dir, b
                 for (int32_t i = 0; i < len; i++) {
                     uint8_t c = ctx->decomp_window[(src + i) & WINDOW_MASK];
 
-                    result = folder_emit_decoded_byte(ctx, &out, &wb, out_dir, fl,
+                    result = folder_emit_decoded_byte(ctx, &out, &wb, stage_dir, fl,
                                                       &current_file, &current_file_written,
                                                       &window_pos, &calc_crc, &total_output,
                                                       expected_total, c);
@@ -2789,7 +4221,7 @@ static DeflateError decompress_folder(const char *infile, const char *out_dir, b
         }
     }
 
-    result = folder_advance_output_file(&out, &wb, out_dir, fl,
+    result = folder_advance_output_file(&out, &wb, stage_dir, fl,
                                         &current_file, &current_file_written);
     if (result != DEFLATE_OK) goto folder_decompress_cleanup;
 
@@ -2827,6 +4259,29 @@ static DeflateError decompress_folder(const char *infile, const char *out_dir, b
         goto folder_decompress_cleanup;
     }
 
+    if (bs_has_trailing_data(&bs)) {
+        LOG_ERR("Error: Trailing data after CRC footer\n");
+        result = DEFLATE_ERR_CORRUPT;
+        goto folder_decompress_cleanup;
+    }
+
+    if (out) {
+        if (!wbuf_flush(&wb)) {
+            LOG_ERR("Error: Write failed during decompression\n");
+            result = DEFLATE_ERR_IO;
+            goto folder_decompress_cleanup;
+        }
+        fclose(out);
+        out = NULL;
+    }
+
+    if (!commit_output_stage_directory(stage_dir, out_dir, output_dir_exists)) {
+        perror("Error finalizing output directory");
+        result = DEFLATE_ERR_IO;
+        goto folder_decompress_cleanup;
+    }
+    stage_committed = true;
+
     LOG_VERBOSE_MSG("Integrity Verified: OK\n");
 
 folder_decompress_cleanup:
@@ -2837,6 +4292,10 @@ folder_decompress_cleanup:
     }
     if (in) fclose(in);
     if (out) fclose(out);
+    if (stage_dir && !stage_committed) {
+        remove_tree_recursive(stage_dir);
+    }
+    SAFE_FREE(stage_dir);
     filelist_destroy(fl);
     return result;
 }
@@ -2875,16 +4334,20 @@ static DeflateError decompress_auto(const char *infile, const char *output) {
 
 static void print_version(void) {
     printf("%s version %s\n", MINIDEFLATE_NAME, MINIDEFLATE_VERSION);
-    printf("Production-grade DEFLATE-style compressor with security hardening.\n");
-    printf("Features: RFC 1951 distance coding, solid archive mode, adaptive blocks.\n");
+    printf("Single-file DEFLATE-style compressor with defensive extraction checks.\n");
+    printf("Features: RFC 1951 distance coding, solid archive mode, adaptive blocks, RSA signature verification.\n");
 }
 
 static void print_usage(const char *prog) {
-    printf("%s - Production-Grade DEFLATE Compressor v%s\n\n", MINIDEFLATE_NAME, MINIDEFLATE_VERSION);
-    printf("Usage: %s [OPTIONS] -c|-d <input> <output>\n\n", prog);
+    printf("%s - Single-File DEFLATE Compressor v%s\n\n", MINIDEFLATE_NAME, MINIDEFLATE_VERSION);
+    printf("Usage: %s [OPTIONS] -c|-d <input> <output>\n", prog);
+    printf("       %s [OPTIONS] --verify --sig <signature> --pubkey <public.pem> <archive>\n\n", prog);
     printf("Options:\n");
     printf("  -c, --compress    Compress file or folder\n");
     printf("  -d, --decompress  Decompress to file or folder (auto-detected)\n");
+    printf("      --verify      Verify detached RSA/SHA-256 archive signature\n");
+    printf("      --sig FILE    Detached signature file (raw PKCS#1 v1.5 signature bytes)\n");
+    printf("      --pubkey FILE RSA public key in PEM/DER SubjectPublicKeyInfo or PKCS#1 format\n");
     printf("  -s, --solid       Enable solid compression for folders (better ratio)\n");
     printf("  -q, --quiet       Suppress non-error output\n");
     printf("  -v, --verbose     Enable verbose output\n");
@@ -2894,7 +4357,9 @@ static void print_usage(const char *prog) {
     printf("  %s -c myfile.txt myfile.proz         # Compress file\n", prog);
     printf("  %s -c myfolder/ archive.proz         # Compress folder\n", prog);
     printf("  %s -c -s myfolder/ archive.proz      # Compress folder (solid mode)\n", prog);
-    printf("  %s -d archive.proz output/           # Decompress (auto-detect)\n", prog);
+    printf("  %s -d archive.proz output/           # Decompress (existing output dirs allowed if names do not collide)\n", prog);
+    printf("  %s -d --sig archive.sig --pubkey public.pem archive.proz output/\n", prog);
+    printf("  %s --verify --sig archive.sig --pubkey public.pem archive.proz\n", prog);
     printf("  %s -v -c large.bin large.proz        # Compress with verbose output\n", prog);
     printf("\nLimits: %lluGB input, %lluGB output\n",
            (unsigned long long)(MAX_INPUT_SIZE / (1024ULL * 1024 * 1024)),
@@ -2914,14 +4379,31 @@ int main(int argc, char *argv[]) {
 
     bool do_compress = false;
     bool do_decompress = false;
+    bool do_verify = false;
     const char *input_path = NULL;
     const char *output_path = NULL;
+    const char *sig_path = NULL;
+    const char *pubkey_path = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--compress") == 0) {
             do_compress = true;
         } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--decompress") == 0) {
             do_decompress = true;
+        } else if (strcmp(argv[i], "--verify") == 0) {
+            do_verify = true;
+        } else if (strcmp(argv[i], "--sig") == 0) {
+            if (i + 1 >= argc) {
+                LOG_ERR("Error: --sig requires a file path\n");
+                return 1;
+            }
+            sig_path = argv[++i];
+        } else if (strcmp(argv[i], "--pubkey") == 0) {
+            if (i + 1 >= argc) {
+                LOG_ERR("Error: --pubkey requires a file path\n");
+                return 1;
+            }
+            pubkey_path = argv[++i];
         } else if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--solid") == 0) {
             g_solid_mode = true;
         } else if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) {
@@ -2949,6 +4431,34 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    if ((sig_path != NULL) != (pubkey_path != NULL)) {
+        LOG_ERR("Error: --sig and --pubkey must be used together\n");
+        return 1;
+    }
+
+    if (do_verify) {
+        if (do_compress || do_decompress) {
+            LOG_ERR("Error: --verify cannot be combined with -c or -d\n");
+            return 1;
+        }
+        if (!sig_path || !pubkey_path) {
+            LOG_ERR("Error: --verify requires --sig and --pubkey\n");
+            return 1;
+        }
+        if (!input_path || output_path) {
+            LOG_ERR("Error: --verify requires exactly one archive path\n");
+            print_usage(argv[0]);
+            return 1;
+        }
+
+        DeflateError verify_result = verify_archive_signature(input_path, sig_path, pubkey_path);
+        if (verify_result != DEFLATE_OK) {
+            LOG_ERR("Error code: %d\n", verify_result);
+            return (verify_result < 0) ? -(int)verify_result : (int)verify_result;
+        }
+        return 0;
+    }
+
     /* Validate arguments */
     if (!do_compress && !do_decompress) {
         LOG_ERR("Error: Must specify -c (compress) or -d (decompress)\n");
@@ -2967,6 +4477,11 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    if (do_compress && sig_path) {
+        LOG_ERR("Error: --sig/--pubkey are only supported with -d or --verify\n");
+        return 1;
+    }
+
     DeflateError result;
     if (do_compress) {
         /* Check if input is a directory */
@@ -2979,6 +4494,13 @@ int main(int argc, char *argv[]) {
             result = compress_file(input_path, output_path);
         }
     } else {
+        if (sig_path) {
+            result = verify_archive_signature(input_path, sig_path, pubkey_path);
+            if (result != DEFLATE_OK) {
+                LOG_ERR("Error code: %d\n", result);
+                return (result < 0) ? -(int)result : (int)result;
+            }
+        }
         /* Auto-detect archive type */
         result = decompress_auto(input_path, output_path);
     }

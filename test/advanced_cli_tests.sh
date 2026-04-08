@@ -3,7 +3,7 @@
 # MiniDeflate v5.0 — Advanced Integration Test Suite
 #
 # Builds deflate.c in a disposable temp directory and exercises the binary
-# through 32 test cases covering:
+# through 43 test cases covering:
 #
 #   Category A  — CLI argument parsing and flags
 #   Category B  — Data integrity round-trips (edge-case payloads)
@@ -323,6 +323,148 @@ raise SystemExit(f"archive entry not found: {target_path}")
 PY
 }
 
+patch_archive_path_by_index() {
+    python3 - "$1" "$2" "$3" <<'PY'
+import sys
+from pathlib import Path
+
+p = Path(sys.argv[1])
+target_index = int(sys.argv[2])
+rep = sys.argv[3].encode('utf-8')
+d = bytearray(p.read_bytes())
+file_count = int.from_bytes(d[4:8], 'little')
+off = 8
+
+if target_index < 0 or target_index >= file_count:
+    raise SystemExit(f'entry index out of range: {target_index}')
+
+for idx in range(file_count):
+    path_len = int.from_bytes(d[off:off + 2], 'little')
+    off += 2
+    if idx == target_index:
+        if len(rep) != path_len:
+            raise SystemExit(
+                f'replacement length {len(rep)} != stored path length {path_len}'
+            )
+        d[off:off + path_len] = rep
+        p.write_bytes(d)
+        raise SystemExit(0)
+    off += path_len + 8
+
+raise SystemExit(f'entry index not found: {target_index}')
+PY
+}
+
+generate_rsa_signature_fixture() {
+    python3 - "$1" "$2" "$3" "$4" <<'PY'
+import base64
+import hashlib
+import random
+import sys
+from pathlib import Path
+
+archive_path = Path(sys.argv[1])
+pubkey_path = Path(sys.argv[2])
+sig_path = Path(sys.argv[3])
+wrong_pubkey_path = Path(sys.argv[4])
+
+rng = random.Random(0xC0FFEE)
+PREFIX = bytes.fromhex('3031300d060960864801650304020105000420')
+E = 65537
+
+def is_probable_prime(n):
+    if n < 2:
+        return False
+    small_primes = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29]
+    for p in small_primes:
+        if n % p == 0:
+            return n == p
+
+    d = n - 1
+    s = 0
+    while d % 2 == 0:
+        s += 1
+        d //= 2
+
+    for _ in range(16):
+        a = rng.randrange(2, n - 2)
+        x = pow(a, d, n)
+        if x == 1 or x == n - 1:
+            continue
+        for _ in range(s - 1):
+            x = pow(x, 2, n)
+            if x == n - 1:
+                break
+        else:
+            return False
+    return True
+
+def gen_prime(bits):
+    while True:
+        n = rng.getrandbits(bits)
+        n |= (1 << (bits - 1)) | 1
+        if is_probable_prime(n) and (n - 1) % E != 0:
+            return n
+
+def der_len(n):
+    if n < 0x80:
+        return bytes([n])
+    b = n.to_bytes((n.bit_length() + 7) // 8, 'big')
+    return bytes([0x80 | len(b)]) + b
+
+def der_int(x):
+    b = x.to_bytes((x.bit_length() + 7) // 8 or 1, 'big')
+    if b[0] & 0x80:
+        b = b'\x00' + b
+    return b'\x02' + der_len(len(b)) + b
+
+def der_seq(*parts):
+    body = b''.join(parts)
+    return b'\x30' + der_len(len(body)) + body
+
+def der_bit_string(data):
+    body = b'\x00' + data
+    return b'\x03' + der_len(len(body)) + body
+
+def pem_wrap(label, der):
+    b64 = base64.b64encode(der).decode('ascii')
+    lines = [b64[i:i + 64] for i in range(0, len(b64), 64)]
+    return f"-----BEGIN {label}-----\n" + '\n'.join(lines) + f"\n-----END {label}-----\n"
+
+def gen_keypair():
+    p = gen_prime(512)
+    q = gen_prime(512)
+    while p == q:
+        q = gen_prime(512)
+    n = p * q
+    phi = (p - 1) * (q - 1)
+    d = pow(E, -1, phi)
+    return n, d
+
+def write_pubkey(path, n):
+    rsa_pub = der_seq(der_int(n), der_int(E))
+    alg = der_seq(
+        b'\x06\x09\x2A\x86\x48\x86\xF7\x0D\x01\x01\x01',
+        b'\x05\x00',
+    )
+    spki = der_seq(alg, der_bit_string(rsa_pub))
+    path.write_text(pem_wrap('PUBLIC KEY', spki), encoding='ascii')
+
+n, d = gen_keypair()
+write_pubkey(pubkey_path, n)
+
+wrong_n, _ = gen_keypair()
+write_pubkey(wrong_pubkey_path, wrong_n)
+
+archive = archive_path.read_bytes()
+digest = hashlib.sha256(archive).digest()
+k = (n.bit_length() + 7) // 8
+em = b'\x00\x01' + b'\xFF' * (k - len(PREFIX) - len(digest) - 3) + b'\x00' + PREFIX + digest
+sig = pow(int.from_bytes(em, 'big'), d, n).to_bytes(k, 'big')
+sig_path.write_bytes(sig)
+PY
+}
+
 # ========================= CATEGORY A: CLI FLAGS ===========================
 
 test_A01_version_flag() {
@@ -368,6 +510,16 @@ test_A07_too_many_args_rejected() {
     run_in_workdir toomany "$BIN" -c ./a ./b ./c
     assert_exit_fail
     assert_stderr_contains "Too many arguments"
+}
+
+test_A08_verify_requires_sig_and_pubkey() {
+    printf 'archive\n' > "$WORK_DIR/a08.txt"
+    run_in_workdir a08_c "$BIN" -c ./a08.txt ./a08.proz
+    assert_exit_ok
+
+    run_in_workdir a08 "$BIN" --verify ./a08.proz
+    assert_exit_fail
+    assert_stderr_contains "--verify requires --sig and --pubkey"
 }
 
 # ========================= CATEGORY B: DATA ROUND-TRIPS ====================
@@ -581,7 +733,7 @@ PY
     run_in_workdir sizeplus_d "$BIN" -d ./sizeplus.proz ./sizeplus-out
     assert_exit_fail
     assert_stderr_contains "Folder payload size mismatch"
-    assert_file_eq "$WORK_DIR/sizeplus-src/payload.txt" "$WORK_DIR/sizeplus-out/payload.txt"
+    assert_not_exists "$WORK_DIR/sizeplus-out"
 }
 
 test_C07_folder_declared_size_too_small_rejected() {
@@ -596,7 +748,159 @@ test_C07_folder_declared_size_too_small_rejected() {
     run_in_workdir sizeminus_d "$BIN" -d ./sizeminus.proz ./sizeminus-out
     assert_exit_fail
     assert_stderr_contains "declared file sizes"
-    assert_file_size "$WORK_DIR/sizeminus-out/payload.txt" 4
+    assert_not_exists "$WORK_DIR/sizeminus-out"
+}
+
+test_C08_trailing_data_after_footer_rejected() {
+    printf 'trailing-data\n' > "$WORK_DIR/trailer-src.txt"
+    run_in_workdir trailer_c "$BIN" -c ./trailer-src.txt ./trailer.proz
+    assert_exit_ok
+
+    python3 - "$WORK_DIR/trailer.proz" <<'PY'
+import sys
+from pathlib import Path
+
+p = Path(sys.argv[1])
+with p.open('ab') as f:
+    f.write(b'TRAIL')
+PY
+
+    run_in_workdir trailer_d "$BIN" -d ./trailer.proz ./trailer.out
+    assert_exit_fail
+    assert_stderr_contains "Trailing data after CRC footer"
+    assert_not_exists "$WORK_DIR/trailer.out"
+}
+
+test_C09_duplicate_archive_paths_rejected() {
+    mkdir -p "$WORK_DIR/dup-src"
+    printf 'alpha\n' > "$WORK_DIR/dup-src/filea.txt"
+    printf 'beta\n' > "$WORK_DIR/dup-src/fileb.txt"
+
+    run_in_workdir dup_c "$BIN" -c ./dup-src ./dup.proz
+    assert_exit_ok
+
+    python3 - "$WORK_DIR/dup.proz" <<'PY'
+import sys
+from pathlib import Path
+
+p = Path(sys.argv[1])
+d = bytearray(p.read_bytes())
+file_count = int.from_bytes(d[4:8], 'little')
+if file_count < 2:
+    raise SystemExit('need at least two entries for duplicate-path test')
+
+off = 8
+path_len0 = int.from_bytes(d[off:off + 2], 'little')
+off += 2
+path0 = d[off:off + path_len0]
+off += path_len0 + 8
+
+path_len1 = int.from_bytes(d[off:off + 2], 'little')
+off += 2
+if path_len1 != path_len0:
+    raise SystemExit('stored path lengths differ; duplicate-path test fixture invalid')
+d[off:off + path_len1] = path0
+p.write_bytes(d)
+PY
+
+    run_in_workdir dup_d "$BIN" -d ./dup.proz ./dup-out
+    assert_exit_fail
+    assert_stderr_contains "duplicate output paths"
+    assert_not_exists "$WORK_DIR/dup-out"
+}
+
+test_C10_missing_eob_huffman_rejected() {
+    python3 - "$WORK_DIR/noeob.proz" <<'PY'
+import sys
+from pathlib import Path
+
+MAGIC = (0x50524F5A).to_bytes(4, 'little')
+max_sym = 65
+depths = [0] * (max_sym + 1)
+depths[64] = 1
+depths[65] = 1  # complete tree, but still no EOB symbol 256
+
+bits = []
+
+def put_bits(value, count):
+    for i in range(count - 1, -1, -1):
+        bits.append((value >> i) & 1)
+
+put_bits(1, 1)          # last block
+put_bits(max_sym, 16)
+for i in range(0, max_sym + 1, 2):
+    put_bits(depths[i], 4)
+    put_bits(depths[i + 1] if i + 1 <= max_sym else 0, 4)
+
+payload = bytearray()
+for i in range(0, len(bits), 8):
+    byte = 0
+    for bit in bits[i:i + 8]:
+        byte = (byte << 1) | bit
+    byte <<= (8 - len(bits[i:i + 8]))
+    payload.append(byte)
+
+Path(sys.argv[1]).write_bytes(MAGIC + payload + (0).to_bytes(4, 'little'))
+PY
+
+    run_in_workdir noeob_d "$BIN" -d ./noeob.proz ./noeob.out
+    assert_exit_fail
+    assert_stderr_contains "Invalid canonical Huffman table"
+    assert_not_exists "$WORK_DIR/noeob.out"
+}
+
+test_C11_mutation_fuzz_no_crash() {
+    printf 'mutation-fuzz-seed\n' > "$WORK_DIR/fuzz.txt"
+    run_in_workdir fuzzseed_c "$BIN" -c ./fuzz.txt ./fuzz.proz
+    assert_exit_ok
+
+    python3 - "$BIN" "$WORK_DIR/fuzz.proz" "$WORK_DIR" <<'PY'
+import random
+import subprocess
+import sys
+from pathlib import Path
+
+bin_path = Path(sys.argv[1])
+seed_archive = Path(sys.argv[2]).read_bytes()
+work = Path(sys.argv[3])
+rng = random.Random(123456)
+
+for i in range(100):
+    data = bytearray(seed_archive)
+    flips = rng.randint(1, min(8, len(data)))
+    for _ in range(flips):
+        idx = rng.randrange(len(data))
+        data[idx] ^= rng.randrange(1, 256)
+
+    arc = work / f'mut-{i:03d}.proz'
+    out = work / f'mut-{i:03d}.out'
+    arc.write_bytes(data)
+    try:
+        cp = subprocess.run([str(bin_path), '-d', str(arc), str(out)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            timeout=1.0)
+    except subprocess.TimeoutExpired:
+        raise SystemExit(f'timeout on mutation {i}')
+
+    if cp.returncode < 0:
+        raise SystemExit(f'process terminated by signal {-cp.returncode} on mutation {i}')
+PY
+}
+
+test_C12_signature_verify_success() {
+    printf 'signed archive\n' > "$WORK_DIR/signed.txt"
+    run_in_workdir sigok_c "$BIN" -c ./signed.txt ./signed.proz
+    assert_exit_ok
+
+    generate_rsa_signature_fixture \
+        "$WORK_DIR/signed.proz" \
+        "$WORK_DIR/public.pem" \
+        "$WORK_DIR/signed.sig" \
+        "$WORK_DIR/wrong-public.pem"
+
+    run_in_workdir sigok_v "$BIN" --verify --sig ./signed.sig --pubkey ./public.pem ./signed.proz
+    assert_exit_ok
+    assert_stdout_contains "Signature Verified"
 }
 
 # ========================= CATEGORY D: SECURITY ============================
@@ -612,6 +916,7 @@ test_D01_crc_corruption_detected() {
     run_in_workdir crc_d "$BIN" -d ./crc-bad.proz ./crc.out
     assert_exit_fail
     assert_stderr_contains "CRC Mismatch"
+    assert_not_exists "$WORK_DIR/crc.out"
 }
 
 test_D02_path_traversal_rejected() {
@@ -629,21 +934,19 @@ test_D02_path_traversal_rejected() {
     assert_not_exists "$WORK_DIR/ab.cd"
 }
 
-test_D03_intermediate_symlink_blocked() {
-    mkdir -p "$WORK_DIR/sym-src/nested"
-    mkdir -p "$WORK_DIR/sym-escape"
-    printf 'secret\n' > "$WORK_DIR/sym-src/nested/payload.txt"
-    run_in_workdir sym_c "$BIN" -c ./sym-src ./sym.proz
+test_D03_output_root_symlink_blocked() {
+    mkdir -p "$WORK_DIR/rootsym-src"
+    mkdir -p "$WORK_DIR/rootsym-real"
+    printf 'secret\n' > "$WORK_DIR/rootsym-src/payload.txt"
+    ln -s "$WORK_DIR/rootsym-real" "$WORK_DIR/rootsym-link"
+
+    run_in_workdir rootsym_c "$BIN" -c ./rootsym-src ./rootsym.proz
     assert_exit_ok
 
-    # Plant a symlink at the intermediate directory in the output tree
-    mkdir -p "$WORK_DIR/sym-out"
-    ln -s "$WORK_DIR/sym-escape" "$WORK_DIR/sym-out/nested"
-
-    run_in_workdir sym_d "$BIN" -d ./sym.proz ./sym-out
+    run_in_workdir rootsym_d "$BIN" -d ./rootsym.proz ./rootsym-link
     assert_exit_fail
-    assert_stderr_contains "symlink in path"
-    assert_not_exists "$WORK_DIR/sym-escape/payload.txt"
+    assert_stderr_contains "Output directory is a symlink"
+    assert_not_exists "$WORK_DIR/rootsym-real/payload.txt"
 }
 
 test_D04_output_symlink_rejected() {
@@ -658,6 +961,88 @@ test_D04_output_symlink_rejected() {
     # Verify the symlink target was not overwritten
     grep -Fq "SENTINEL" "$WORK_DIR/sym-real.proz" || \
         fail "symlink target was overwritten"
+}
+
+test_D05_existing_output_directory_without_conflicts_allowed() {
+    mkdir -p "$WORK_DIR/nonempty-src"
+    mkdir -p "$WORK_DIR/nonempty-out"
+    printf 'payload\n' > "$WORK_DIR/nonempty-src/file.txt"
+    printf 'keep\n' > "$WORK_DIR/nonempty-out/existing.txt"
+
+    run_in_workdir nonempty_c "$BIN" -c ./nonempty-src ./nonempty.proz
+    assert_exit_ok
+
+    run_in_workdir nonempty_d "$BIN" -d ./nonempty.proz ./nonempty-out
+    assert_exit_ok
+    assert_file_size "$WORK_DIR/nonempty-out/existing.txt" 5
+    assert_file_eq "$WORK_DIR/nonempty-src/file.txt" "$WORK_DIR/nonempty-out/file.txt"
+}
+
+test_D06_folder_crc_corruption_leaves_no_outputs() {
+    mkdir -p "$WORK_DIR/foldercrc-src/sub"
+    printf 'alpha\n' > "$WORK_DIR/foldercrc-src/a.txt"
+    printf 'beta\n' > "$WORK_DIR/foldercrc-src/sub/b.txt"
+
+    run_in_workdir foldercrc_c "$BIN" -c ./foldercrc-src ./foldercrc.proz
+    assert_exit_ok
+
+    cp "$WORK_DIR/foldercrc.proz" "$WORK_DIR/foldercrc-bad.proz"
+    flip_last_byte "$WORK_DIR/foldercrc-bad.proz"
+
+    run_in_workdir foldercrc_d "$BIN" -d ./foldercrc-bad.proz ./foldercrc-out
+    assert_exit_fail
+    assert_stderr_contains "CRC Mismatch"
+    assert_not_exists "$WORK_DIR/foldercrc-out"
+}
+
+test_D07_existing_output_directory_conflict_rejected() {
+    mkdir -p "$WORK_DIR/conflict-src"
+    mkdir -p "$WORK_DIR/conflict-out"
+    printf 'archive\n' > "$WORK_DIR/conflict-src/file.txt"
+    printf 'preexisting\n' > "$WORK_DIR/conflict-out/file.txt"
+
+    run_in_workdir conflict_c "$BIN" -c ./conflict-src ./conflict.proz
+    assert_exit_ok
+
+    run_in_workdir conflict_d "$BIN" -d ./conflict.proz ./conflict-out
+    assert_exit_fail
+    assert_stderr_contains "Error finalizing output directory"
+    assert_file_size "$WORK_DIR/conflict-out/file.txt" 12
+}
+
+test_D08_signed_decompress_tampered_archive_rejected() {
+    printf 'signed payload\n' > "$WORK_DIR/signed-src.txt"
+    run_in_workdir signed_c "$BIN" -c ./signed-src.txt ./signed-archive.proz
+    assert_exit_ok
+
+    generate_rsa_signature_fixture \
+        "$WORK_DIR/signed-archive.proz" \
+        "$WORK_DIR/signed-public.pem" \
+        "$WORK_DIR/signed-archive.sig" \
+        "$WORK_DIR/signed-wrong-public.pem"
+
+    flip_last_byte "$WORK_DIR/signed-archive.proz"
+
+    run_in_workdir signed_d "$BIN" -d --sig ./signed-archive.sig --pubkey ./signed-public.pem ./signed-archive.proz ./signed.out
+    assert_exit_fail
+    assert_stderr_contains "Signature verification failed"
+    assert_not_exists "$WORK_DIR/signed.out"
+}
+
+test_D09_signature_wrong_key_rejected() {
+    printf 'signed payload\n' > "$WORK_DIR/wrongkey-src.txt"
+    run_in_workdir wrongkey_c "$BIN" -c ./wrongkey-src.txt ./wrongkey.proz
+    assert_exit_ok
+
+    generate_rsa_signature_fixture \
+        "$WORK_DIR/wrongkey.proz" \
+        "$WORK_DIR/wrongkey-public.pem" \
+        "$WORK_DIR/wrongkey.sig" \
+        "$WORK_DIR/wrongkey-other.pem"
+
+    run_in_workdir wrongkey_v "$BIN" --verify --sig ./wrongkey.sig --pubkey ./wrongkey-other.pem ./wrongkey.proz
+    assert_exit_fail
+    assert_stderr_contains "Signature verification failed"
 }
 
 # ========================= CATEGORY E: OUTPUT MODES ========================
@@ -732,6 +1117,7 @@ main() {
     run_test test_A05_unknown_option_rejected
     run_test test_A06_missing_paths_rejected
     run_test test_A07_too_many_args_rejected
+    run_test test_A08_verify_requires_sig_and_pubkey
 
     # --- Category B: Data round-trips ---
     printf '\n%s\n' '--- Category B: Data Integrity Round-Trips ---'
@@ -757,13 +1143,23 @@ main() {
     run_test test_C05_nonexistent_input_rejected
     run_test test_C06_folder_declared_size_too_large_rejected
     run_test test_C07_folder_declared_size_too_small_rejected
+    run_test test_C08_trailing_data_after_footer_rejected
+    run_test test_C09_duplicate_archive_paths_rejected
+    run_test test_C10_missing_eob_huffman_rejected
+    run_test test_C11_mutation_fuzz_no_crash
+    run_test test_C12_signature_verify_success
 
     # --- Category D: Security ---
     printf '\n%s\n' '--- Category D: Security Hardening ---'
     run_test test_D01_crc_corruption_detected
     run_test test_D02_path_traversal_rejected
-    run_test test_D03_intermediate_symlink_blocked
+    run_test test_D03_output_root_symlink_blocked
     run_test test_D04_output_symlink_rejected
+    run_test test_D05_existing_output_directory_without_conflicts_allowed
+    run_test test_D06_folder_crc_corruption_leaves_no_outputs
+    run_test test_D07_existing_output_directory_conflict_rejected
+    run_test test_D08_signed_decompress_tampered_archive_rejected
+    run_test test_D09_signature_wrong_key_rejected
 
     # --- Category E: Output modes ---
     printf '\n%s\n' '--- Category E: Output Mode Behaviour ---'
