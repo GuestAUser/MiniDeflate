@@ -7,7 +7,7 @@
 [![Version](https://img.shields.io/badge/version-6.0.0-blue.svg)]()
 [![C99](https://img.shields.io/badge/standard-C99-green.svg)]()
 [![License](https://img.shields.io/badge/license-Proprietary-red.svg)]()
-[![Tests](https://img.shields.io/badge/tests-43%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-46%20passed-brightgreen.svg)]()
 
 MiniDeflate is a compact archive and compression utility implemented as a single C99 compilation unit with zero third-party runtime dependencies. It combines a bounded hash-chain LZSS front end, RFC 1951-inspired distance coding, canonical Huffman block coding, and a hardened extraction pipeline into an implementation that is small enough to audit in one file but rich enough to serve as a serious engineering tool.
 
@@ -236,6 +236,8 @@ For each compressed block, the decompressor:
 
 Existing output directories are allowed when extracted top-level names do not collide with pre-existing entries.
 
+Host-side CLI filesystem paths are validated separately from archive-member paths. MiniDeflate accepts only **relative host paths** rooted at the current working directory; absolute paths, Windows drive paths, and `..` path components in caller-supplied input/output/signature/key arguments are rejected before I/O begins.
+
 ---
 
 ## Security Architecture
@@ -361,14 +363,14 @@ These changes preserve bitstream compatibility: archives produced by v6.0 are id
 bash test/advanced_cli_tests.sh
 ```
 
-The suite builds `deflate.c` from source in a disposable temporary directory and exercises the resulting binary through **43 test cases** organized into five categories:
+The suite builds `deflate.c` from source in a disposable temporary directory and exercises the resulting binary through **46 test cases** organized into five categories:
 
 | Category | Tests | Coverage |
 |----------|-------|----------|
 | **A: CLI Parsing** | 8 | Every documented flag, conflicting options, missing arguments |
 | **B: Data Round-Trips** | 12 | Mixed payloads, single byte, all zeros, incompressible PRNG, nested folders, solid mode, empty files, multi-block, absolute paths |
 | **C: Format Validation** | 12 | Magic bytes, truncation, declared-size corruption, trailing data, duplicate paths, malformed Huffman, mutation fuzz (100 random byte flips), signature verification |
-| **D: Security Hardening** | 9 | CRC tampering, path traversal injection, output symlink blocking, staged cleanup on failure, flexible output directories, signature-gated extraction |
+| **D: Security Hardening** | 12 | CRC tampering, archive/member traversal injection, host-path policy rejection for absolute and `..` arguments, output symlink blocking, staged cleanup on failure, flexible output directories, signature-gated extraction |
 | **E: Output Modes** | 2 | Verbose detail emission, quiet mode suppression |
 
 Prerequisites: a C99 compiler (`cc` or `$CC`), `python3`, `diff`, `cmp`, and `ln -s`. Typical run time is approximately 2 seconds.

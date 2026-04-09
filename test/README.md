@@ -2,7 +2,7 @@
 
 Integration tests for MiniDeflate v6.0. The suite builds `deflate.c` from
 source in an isolated temp directory and exercises the resulting binary through
-**43 test cases** organised into five categories.
+**46 test cases** organised into five categories.
 
 ---
 
@@ -70,8 +70,8 @@ that stress different compressor code paths.
 | `B08_folder_empty_files` | Folder with 0-byte + non-empty files | Non-empty files extracted correctly alongside empty ones |
 | `B09_large_multiblock` | 2 MB seeded PRNG (seed 99) | Exact match, exercises multiple Huffman blocks |
 | `B10_folder_all_empty_files` | Folder with only 0-byte files, including nested paths | Recursive `diff -qr` match. Verifies every empty file is recreated |
-| `B11_absolute_file_paths` | Absolute host paths for input, archive, and output | Exact round-trip using non-relative CLI arguments |
-| `B12_absolute_folder_paths` | Absolute host paths for folder input, archive, and output directory | Recursive `diff -qr` match for folder mode |
+| `B11_explicit_current_directory_file` | File round-trip using explicit `./` host paths | Exact match with current-directory rooted CLI arguments |
+| `B12_explicit_current_directory_folder` | Folder round-trip using explicit `./` host paths | Recursive `diff -qr` match for folder mode |
 
 ### Category C — Archive Format Validation (12 tests)
 
@@ -92,7 +92,7 @@ Tests the binary format layer: magic bytes, bad input, truncation.
 | `C11_mutation_fuzz_no_crash` | 100 random byte mutations of a valid archive | Decompressor never hangs or crashes on the mutation corpus |
 | `C12_signature_verify_success` | Detached RSA/SHA-256 signature over a valid archive | `--verify` succeeds and reports `Signature Verified` |
 
-### Category D — Security Hardening (9 tests)
+### Category D — Security Hardening (12 tests)
 
 Validates the 27 documented security fixes. These are adversarial tests that
 craft malicious inputs and verify fail-closed behaviour.
@@ -108,6 +108,9 @@ craft malicious inputs and verify fail-closed behaviour.
 | `D07_existing_output_conflict` | Folder extraction target already contains a colliding top-level name | Extraction is rejected before any archive content is committed |
 | `D08_signed_decompress_tampered` | Archive is modified after a detached signature is generated | Signature verification fails and decompression leaves no output behind |
 | `D09_signature_wrong_key` | Archive signature checked with the wrong RSA public key | `--verify` fails authentication |
+| `D10_absolute_host_paths` | Caller supplies absolute host input/output/archive paths | Compression and decompression reject the request with `Invalid path` |
+| `D11_parent_directory_host_paths` | Caller supplies `..` host path components | Compression and decompression reject the request with `Invalid path` |
+| `D12_verify_mode_host_paths` | `--verify` is given absolute archive/signature/public-key paths | Verification rejects the request before reading host files |
 
 #### Path Traversal Test Details
 
@@ -169,7 +172,8 @@ and exits non-zero.
    letter and `##` is the next sequential number.
 
 2. Use `run_in_workdir <label> "$BIN" ...` for relative-path tests or `run_raw`
-   when you want to exercise absolute host filesystem paths.
+   when you want to preserve the caller's original working directory while still
+   exercising explicit host-path policy cases.
 
 3. Follow the run with assertions.
 
