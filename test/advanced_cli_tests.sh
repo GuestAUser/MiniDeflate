@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ===========================================================================
-# MiniDeflate v5.0 — Advanced Integration Test Suite
+# MiniDeflate v6.0 — Advanced Integration Test Suite
 #
 # Builds deflate.c in a disposable temp directory and exercises the binary
 # through 43 test cases covering:
@@ -470,7 +470,7 @@ PY
 test_A01_version_flag() {
     run_in_workdir version "$BIN" --version
     assert_exit_ok
-    assert_stdout_contains "MiniDeflate version 5.0.0"
+    assert_stdout_contains "MiniDeflate version 6.0.0"
     assert_stdout_contains "RFC 1951"
 }
 

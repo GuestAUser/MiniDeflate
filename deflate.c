@@ -1,5 +1,5 @@
 /**
- * MiniDeflate v5.0.0 - Production-Grade DEFLATE-Style Compressor
+ * MiniDeflate v6.0.0 - Production-Grade DEFLATE-Style Compressor
  *
  * A secure, high-performance hybrid compressor using LZSS + Canonical Huffman.
  * Implements RFC 1951 distance coding for improved compression ratios.
@@ -19,7 +19,7 @@
 
 /*
  * ============================================================================
- * SECURITY HARDENING (24 fixes):
+ * SECURITY HARDENING (27 fixes):
  * ----------------------------------------------------------------------------
  * 1. Window bookkeeping: replaced ambiguous 'len' with 'bytes_in_window'
  * 2. Heap API: heap_push() returns bool; callers check for overflow
@@ -63,6 +63,14 @@
  * - Component-wise ".." validation (allows "file..txt") [FIX #23]
  * - lstat() in traverse_directory prevents symlink following [FIX #24]
  * ============================================================================
+ * VERSION 6.0.0 ENHANCEMENTS:
+ * - Split parse-stage hash insertion from full match search on multi-byte advances
+ * - Constant-time distance-code lookup for the active 4KiB window
+ * - Allocation-free per-block Huffman build including heap metadata
+ * - Inline block frequency accumulation removes encode_block() token rescans
+ * - Canonical decode arrays replace O(n*t_count) slow-path with O(code_length)
+ * - O(n^2) prefix validation gated behind DEBUG (Kraft check remains always-on)
+ * ============================================================================
  */
 
 #include <stdio.h>
@@ -75,7 +83,7 @@
 #include <stdarg.h>
 
 /* Version info */
-#define MINIDEFLATE_VERSION "5.0.0"
+#define MINIDEFLATE_VERSION "6.0.0"
 #define MINIDEFLATE_NAME "MiniDeflate"
 
 /* FIX #17: Platform-specific includes for secure file operations */
@@ -140,7 +148,6 @@
 #define MAX_INPUT_SIZE        ((uint64_t)25 * 1024 * 1024 * 1024)
 #define MAX_OUTPUT_SIZE       ((uint64_t)50 * 1024 * 1024 * 1024)
 #define MAX_HUFFMAN_DEPTH     15
-#define MAX_DECODE_ITERATIONS 64
 #define MAX_BLOCKS            4000000
 #define RSA_MAX_BITS          4096
 #define RSA_MAX_WORDS         (RSA_MAX_BITS / 32)
@@ -218,6 +225,15 @@ static const uint8_t dist_extra_bits[NUM_DIST_CODES] = {
     9, 9, 10, 10, 11, 11, 12, 12, 13, 13
 };
 
+typedef struct {
+    uint8_t code;
+    uint8_t extra_bits;
+    uint16_t extra;
+} DistCodeInfo;
+
+static DistCodeInfo g_dist_lookup[WINDOW_SIZE + 1];
+static bool g_dist_lookup_ready = false;
+
 /* Convert distance to code + extra bits */
 static void dist_to_code(uint16_t dist, uint8_t *code_out, uint16_t *extra_out, uint8_t *extra_bits_out) {
     if (dist == 0) {
@@ -238,6 +254,34 @@ static void dist_to_code(uint16_t dist, uint8_t *code_out, uint16_t *extra_out, 
     *code_out = (uint8_t)lo;
     *extra_out = dist - dist_base[lo];
     *extra_bits_out = dist_extra_bits[lo];
+}
+
+static void init_dist_lookup(void) {
+    if (g_dist_lookup_ready) return;
+
+    for (uint16_t dist = 1; dist <= WINDOW_SIZE; dist++) {
+        dist_to_code(dist,
+                     &g_dist_lookup[dist].code,
+                     &g_dist_lookup[dist].extra,
+                     &g_dist_lookup[dist].extra_bits);
+    }
+
+    g_dist_lookup_ready = true;
+}
+
+static inline void dist_to_code_cached(uint16_t dist,
+                                       uint8_t *code_out,
+                                       uint16_t *extra_out,
+                                       uint8_t *extra_bits_out) {
+    if (dist > 0 && dist <= WINDOW_SIZE && g_dist_lookup_ready) {
+        const DistCodeInfo *info = &g_dist_lookup[dist];
+        *code_out = info->code;
+        *extra_out = info->extra;
+        *extra_bits_out = info->extra_bits;
+        return;
+    }
+
+    dist_to_code(dist, code_out, extra_out, extra_bits_out);
 }
 
 /* Convert code + extra bits to distance */
@@ -379,6 +423,13 @@ typedef struct {
     Token *token_buf;
     uint8_t *decomp_window;
     FastDecodeEntry *decode_table;
+    /* v6.0: Canonical decode arrays for O(code_length) slow-path lookup.
+     * Rebuilt per block alongside the fast decode table. */
+    int32_t decode_bl_count[MAX_HUFFMAN_DEPTH + 2];
+    uint64_t decode_first_code[MAX_HUFFMAN_DEPTH + 2];
+    int32_t decode_sym_offset[MAX_HUFFMAN_DEPTH + 2];
+    uint16_t decode_sorted_syms[SYMBOL_COUNT];
+    int32_t decode_max_len;
     uint64_t bytes_in;   /* FIX #7: uint64_t for portable size tracking */
     uint64_t bytes_out;
 } DeflateContext;
@@ -2457,21 +2508,8 @@ static void find_best_match(const DeflateContext *ctx, uint16_t pos,
 
 /* ==================== HUFFMAN CODING ==================== */
 
-static MinHeap* heap_create(int32_t cap) {
-    MinHeap *h = malloc(sizeof(MinHeap));
-    if (!h) return NULL;
-    h->nodes = malloc(sizeof(HuffmanNode*) * (size_t)cap);
-    if (!h->nodes) {
-        free(h);
-        return NULL;
-    }
-    h->size = 0;
-    h->capacity = cap;
-    return h;
-}
-
-/* heap_destroy removed: arena allocator owns all HuffmanNode memory now.
- * Heap struct is freed directly in build_huffman_codes cleanup. */
+/* MinHeap storage is caller-provided so Huffman building stays allocation-free
+ * in the hot per-block path. Arena storage still owns all HuffmanNode memory. */
 
 /**
  * FIX #2: Returns false on overflow instead of silently failing.
@@ -2537,14 +2575,17 @@ static void get_tree_depths(HuffmanNode *root, int32_t depth, uint8_t *lens) {
 
 static DeflateError build_huffman_codes(const uint64_t *freqs, CanonicalEntry *table,
                                          uint8_t *depths, uint16_t *max_sym_out) {
-    MinHeap *h = NULL;
+    MinHeap heap;
+    HuffmanNode *heap_nodes[SYMBOL_COUNT * 2];
+    MinHeap *h = &heap;
     HuffmanNode *root = NULL;
     HuffmanArena arena;
     DeflateError result = DEFLATE_OK;
 
     arena_init(&arena);
-    h = heap_create(SYMBOL_COUNT * 2);
-    if (!h) return DEFLATE_ERR_MEM;
+    h->nodes = heap_nodes;
+    h->size = 0;
+    h->capacity = SYMBOL_COUNT * 2;
 
     memset(depths, 0, SYMBOL_COUNT);
     *max_sym_out = 0;
@@ -2670,8 +2711,6 @@ static DeflateError build_huffman_codes(const uint64_t *freqs, CanonicalEntry *t
     }
 
 cleanup:
-    /* Arena nodes are stack-allocated — no free needed. Only free heap struct. */
-    if (h) { free(h->nodes); free(h); }
     return result;
 }
 
@@ -2679,15 +2718,8 @@ static bool validate_canonical_entries(const CanonicalEntry *table, int32_t t_co
                                        bool require_eob);
 
 static DeflateError encode_block(DeflateContext *ctx, BitStream *bs,
-                                 int32_t token_count, bool is_last) {
-    uint64_t freqs[SYMBOL_COUNT] = {0};
-
-    for (int32_t i = 0; i < token_count; i++) {
-        if (ctx->token_buf[i].val >= SYMBOL_COUNT) return DEFLATE_ERR_CORRUPT;
-        freqs[ctx->token_buf[i].val]++;
-    }
-    freqs[256] = 1;  /* EOB marker */
-
+                                 const uint64_t *freqs, int32_t token_count,
+                                 bool is_last) {
     CanonicalEntry table[SYMBOL_COUNT] = {0};
     uint8_t depths[SYMBOL_COUNT];
     uint16_t max_sym = 0;
@@ -2773,38 +2805,56 @@ static DeflateError build_fast_decode_table(FastDecodeEntry *decode_table,
     return DEFLATE_OK;
 }
 
-/* Zero-copy fast decode: peek FAST_DECODE_BITS from bit_acc without
- * save/restore. The batched bs_refill keeps bits in bit_acc so peeking
- * is a single shift+mask. Ghost buffer issue is eliminated because
- * bs_refill is called once upfront, not speculatively during peek. */
-static int32_t decode_symbol_fast(BitStream *bs, const FastDecodeEntry *decode_table,
-                                   const CanonicalEntry *table, int32_t t_count) {
+static void build_canonical_decoder(DeflateContext *ctx,
+                                    const CanonicalEntry *table, int32_t t_count,
+                                    const int32_t *bl_count) {
+    uint64_t fc = 0;
+    int32_t sym_idx = 0;
+    ctx->decode_max_len = 0;
+
+    for (int32_t len = 1; len <= MAX_HUFFMAN_DEPTH; len++) {
+        fc = (fc + (uint64_t)bl_count[len - 1]) << 1;
+        ctx->decode_first_code[len] = fc;
+        ctx->decode_bl_count[len] = bl_count[len];
+        ctx->decode_sym_offset[len] = sym_idx;
+        sym_idx += bl_count[len];
+        if (bl_count[len] > 0) ctx->decode_max_len = len;
+    }
+
+    int32_t pos_arr[MAX_HUFFMAN_DEPTH + 2];
+    memcpy(pos_arr, ctx->decode_sym_offset, sizeof(pos_arr));
+    for (int32_t i = 0; i < t_count; i++) {
+        ctx->decode_sorted_syms[pos_arr[table[i].len]++] = table[i].sym;
+    }
+}
+
+static int32_t decode_symbol_fast(BitStream *bs, const DeflateContext *ctx) {
     if (bs_refill(bs, FAST_DECODE_BITS)) {
         uint32_t peek = (uint32_t)((bs->bit_acc >> (bs->bit_count - FAST_DECODE_BITS))
                         & (FAST_DECODE_SIZE - 1));
-        FastDecodeEntry entry = decode_table[peek];
+        FastDecodeEntry entry = ctx->decode_table[peek];
         if (entry.bits_used > 0 && entry.bits_used <= FAST_DECODE_BITS) {
             bs->bit_count -= entry.bits_used;
             return entry.symbol;
         }
     }
 
-    /* Slow path: bit-by-bit decoding for codes longer than FAST_DECODE_BITS */
     uint64_t curr_code = 0;
     int32_t curr_len = 0;
 
-    for (int32_t iter = 0; iter < MAX_DECODE_ITERATIONS; iter++) {
+    while (curr_len < ctx->decode_max_len) {
         int32_t b = bs_read_bit(bs);
         if (b == -1) return -1;
 
         curr_code = (curr_code << 1) | (uint64_t)b;
         curr_len++;
 
-        if (curr_len > MAX_HUFFMAN_DEPTH) return -1;
+        if (curr_len > ctx->decode_max_len) return -1;
 
-        for (int32_t k = 0; k < t_count; k++) {
-            if (table[k].len == curr_len && table[k].code == curr_code) {
-                return table[k].sym;
+        if (ctx->decode_bl_count[curr_len] > 0) {
+            int64_t offset = (int64_t)curr_code - (int64_t)ctx->decode_first_code[curr_len];
+            if (offset >= 0 && offset < (int64_t)ctx->decode_bl_count[curr_len]) {
+                return ctx->decode_sorted_syms[ctx->decode_sym_offset[curr_len] + (int32_t)offset];
             }
         }
     }
@@ -2841,6 +2891,7 @@ static bool validate_canonical_entries(const CanonicalEntry *table, int32_t t_co
         if (table[i].sym == 256) has_eob = true;
     }
 
+#ifdef DEBUG
     for (int32_t i = 0; i < t_count; i++) {
         for (int32_t j = i + 1; j < t_count; j++) {
             uint16_t code_a = table[i].code;
@@ -2857,6 +2908,7 @@ static bool validate_canonical_entries(const CanonicalEntry *table, int32_t t_co
             }
         }
     }
+#endif
 
     return !require_eob || has_eob;
 }
@@ -2970,13 +3022,20 @@ static inline void token_set_match(Token *tok, int32_t match_len, uint16_t dist)
     uint16_t d_extra;
     uint8_t d_extra_bits;
 
-    dist_to_code(dist, &d_code, &d_extra, &d_extra_bits);
+    dist_to_code_cached(dist, &d_code, &d_extra, &d_extra_bits);
 
     tok->type = 1;
     tok->val = (uint16_t)((match_len - MIN_MATCH) + 257);
     tok->dist_code = d_code;
     tok->dist_extra = d_extra;
     tok->dist_extra_bits = d_extra_bits;
+}
+
+static inline void hash_insert_position(DeflateContext *ctx, uint16_t pos, int32_t bytes_avail) {
+    if (bytes_avail < MIN_MATCH) return;
+
+    uint32_t h = (bytes_avail >= 4) ? hash4(&ctx->window[pos]) : hash3(&ctx->window[pos]);
+    hash_insert(&ctx->hash_chain, h, pos);
 }
 
 static inline void prime_match_at_position(DeflateContext *ctx, uint16_t pos,
@@ -2988,9 +3047,7 @@ static inline void prime_match_at_position(DeflateContext *ctx, uint16_t pos,
     if (bytes_avail < MIN_MATCH) return;
 
     find_best_match(ctx, pos, bytes_avail, match_pos, match_len);
-
-    uint32_t h = (bytes_avail >= 4) ? hash4(&ctx->window[pos]) : hash3(&ctx->window[pos]);
-    hash_insert(&ctx->hash_chain, h, pos);
+    hash_insert_position(ctx, pos, bytes_avail);
 }
 
 /* Greedy parsing leaves ratio on the table for short matches. Probe the next
@@ -3095,6 +3152,7 @@ static DeflateError compress_file(const char *infile, const char *outfile) {
     }
 
     init_crc32_tables(&ctx->crc_tables);
+    init_dist_lookup();
     hash_init(&ctx->hash_chain);
 
     ctx->token_buf = calloc(BLOCK_SIZE, sizeof(Token));
@@ -3142,13 +3200,16 @@ static DeflateError compress_file(const char *infile, const char *outfile) {
     /* FIX #25: Empty file — emit a single block with only EOB so decompressor
      * sees a valid last-block instead of reading CRC bytes as block data. */
     if (bytes_in_window == 0) {
-        result = encode_block(ctx, &bs, 0, true);
+        uint64_t block_freqs[SYMBOL_COUNT] = {0};
+        block_freqs[256] = 1;
+        result = encode_block(ctx, &bs, block_freqs, 0, true);
         if (result != DEFLATE_OK) goto compress_cleanup;
     }
 
     /* Main compression loop */
     while (bytes_in_window > 0) {
         int32_t tok_count = 0;
+        uint64_t block_freqs[SYMBOL_COUNT] = {0};
 
         while (tok_count < BLOCK_SIZE && bytes_in_window > 0) {
             /* Clamp match length to available data */
@@ -3159,6 +3220,7 @@ static DeflateError compress_file(const char *infile, const char *outfile) {
                 /* Emit literal */
                 match_len = 1;
                 token_set_literal(&ctx->token_buf[tok_count], ctx->window[read_pos]);
+                block_freqs[ctx->token_buf[tok_count].val]++;
 
                 uint8_t b = ctx->window[read_pos];
                 crc = update_crc32(&ctx->crc_tables, crc, &b, 1);
@@ -3166,6 +3228,7 @@ static DeflateError compress_file(const char *infile, const char *outfile) {
                 /* Emit match with RFC 1951 distance coding */
                 uint16_t dist = (read_pos - match_pos) & WINDOW_MASK;
                 token_set_match(&ctx->token_buf[tok_count], match_len, dist);
+                block_freqs[ctx->token_buf[tok_count].val]++;
 
                 crc = update_crc32(&ctx->crc_tables, crc, &ctx->window[read_pos], (size_t)match_len);
             }
@@ -3200,11 +3263,15 @@ static DeflateError compress_file(const char *infile, const char *outfile) {
                     memset(ctx->hash_chain.head, 0xFF, sizeof(ctx->hash_chain.head));
                 }
 
-                /* Find next match */
-                int32_t new_pos = 0, new_len = 0;
-                prime_match_at_position(ctx, read_pos, bytes_in_window, &new_pos, &new_len);
-                match_pos = new_pos;
-                match_len = new_len;
+                if (i + 1 < advance) {
+                    hash_insert_position(ctx, read_pos, bytes_in_window);
+                } else {
+                    /* Find next match only for the next actual parse position. */
+                    int32_t new_pos = 0, new_len = 0;
+                    prime_match_at_position(ctx, read_pos, bytes_in_window, &new_pos, &new_len);
+                    match_pos = new_pos;
+                    match_len = new_len;
+                }
             }
 
             /* Check for adaptive early block flush (after advancing) */
@@ -3215,7 +3282,8 @@ static DeflateError compress_file(const char *infile, const char *outfile) {
         }
 
         /* Encode block */
-        result = encode_block(ctx, &bs, tok_count, bytes_in_window <= 0);
+        block_freqs[256] = 1;
+        result = encode_block(ctx, &bs, block_freqs, tok_count, bytes_in_window <= 0);
         if (result != DEFLATE_OK) goto compress_cleanup;
     }
 
@@ -3313,7 +3381,7 @@ static DeflateError compress_folder(const char *folder_path, const char *outfile
             perror("Error opening output");
         }
         filelist_destroy(fl);
-        return DEFLATE_ERR_IO;
+        return is_symlink ? DEFLATE_ERR_PATH : DEFLATE_ERR_IO;
     }
 
     /* Write archive header - use different magic for solid mode */
@@ -3342,6 +3410,7 @@ static DeflateError compress_folder(const char *folder_path, const char *outfile
     }
 
     init_crc32_tables(&ctx->crc_tables);
+    init_dist_lookup();
     hash_init(&ctx->hash_chain);
 
     ctx->token_buf = calloc(BLOCK_SIZE, sizeof(Token));
@@ -3406,6 +3475,7 @@ static DeflateError compress_folder(const char *folder_path, const char *outfile
 
         /* Build token block */
         int32_t tok_count = 0;
+        uint64_t block_freqs[SYMBOL_COUNT] = {0};
         while (tok_count < BLOCK_SIZE && bytes_in_window > 0) {
             if (match_len > bytes_in_window) match_len = bytes_in_window;
 
@@ -3413,12 +3483,14 @@ static DeflateError compress_folder(const char *folder_path, const char *outfile
                 should_emit_literal_for_better_match(ctx, read_pos, bytes_in_window, match_len)) {
                 match_len = 1;
                 token_set_literal(&ctx->token_buf[tok_count], ctx->window[read_pos]);
+                block_freqs[ctx->token_buf[tok_count].val]++;
 
                 uint8_t b = ctx->window[read_pos];
                 crc = update_crc32(&ctx->crc_tables, crc, &b, 1);
             } else {
                 uint16_t dist = (read_pos - match_pos) & WINDOW_MASK;
                 token_set_match(&ctx->token_buf[tok_count], match_len, dist);
+                block_freqs[ctx->token_buf[tok_count].val]++;
 
                 crc = update_crc32(&ctx->crc_tables, crc, &ctx->window[read_pos], (size_t)match_len);
             }
@@ -3460,10 +3532,14 @@ static DeflateError compress_folder(const char *folder_path, const char *outfile
                     memset(ctx->hash_chain.head, 0xFF, sizeof(ctx->hash_chain.head));
                 }
 
-                int32_t new_pos = 0, new_len = 0;
-                prime_match_at_position(ctx, read_pos, bytes_in_window, &new_pos, &new_len);
-                match_pos = new_pos;
-                match_len = new_len;
+                if (i + 1 < advance) {
+                    hash_insert_position(ctx, read_pos, bytes_in_window);
+                } else {
+                    int32_t new_pos = 0, new_len = 0;
+                    prime_match_at_position(ctx, read_pos, bytes_in_window, &new_pos, &new_len);
+                    match_pos = new_pos;
+                    match_len = new_len;
+                }
             }
 
             /* Check for adaptive early block flush (after advancing) */
@@ -3474,13 +3550,16 @@ static DeflateError compress_folder(const char *folder_path, const char *outfile
 
         /* Encode block */
         bool is_last = (bytes_in_window == 0 && current_file >= fl->count);
-        result = encode_block(ctx, &bs, tok_count, is_last);
+        block_freqs[256] = 1;
+        result = encode_block(ctx, &bs, block_freqs, tok_count, is_last);
         if (result != DEFLATE_OK) goto folder_compress_cleanup;
     }
 
     /* FIX #25: If all files were empty, no blocks were emitted — write one */
     if (bs.bytes_written == 0 && bs.bit_count == 0) {
-        result = encode_block(ctx, &bs, 0, true);
+        uint64_t block_freqs[SYMBOL_COUNT] = {0};
+        block_freqs[256] = 1;
+        result = encode_block(ctx, &bs, block_freqs, 0, true);
         if (result != DEFLATE_OK) goto folder_compress_cleanup;
     }
 
@@ -3680,10 +3759,11 @@ static DeflateError decompress_file(const char *infile, const char *outfile) {
             result = DEFLATE_ERR_CORRUPT;
             goto decompress_cleanup;
         }
+        build_canonical_decoder(ctx, table, t_count, bl_count);
 
         /* Decode symbols */
         while (1) {
-            int32_t sym = decode_symbol_fast(&bs, ctx->decode_table, table, t_count);
+            int32_t sym = decode_symbol_fast(&bs, ctx);
             if (sym == -1) {
                 LOG_ERR("Error: Invalid Huffman symbol\n");
                 result = DEFLATE_ERR_CORRUPT;
@@ -4148,10 +4228,11 @@ static DeflateError decompress_folder(const char *infile, const char *out_dir, b
             result = DEFLATE_ERR_CORRUPT;
             goto folder_decompress_cleanup;
         }
+        build_canonical_decoder(ctx, table, t_count, bl_count);
 
         /* Decode symbols */
         while (1) {
-            int32_t sym = decode_symbol_fast(&bs, ctx->decode_table, table, t_count);
+            int32_t sym = decode_symbol_fast(&bs, ctx);
             if (sym == -1) {
                 result = DEFLATE_ERR_CORRUPT;
                 goto folder_decompress_cleanup;
@@ -4232,13 +4313,6 @@ static DeflateError decompress_folder(const char *infile, const char *out_dir, b
         result = DEFLATE_ERR_CORRUPT;
         goto folder_decompress_cleanup;
     }
-
-    LOG_VERBOSE_MSG("Footer state: total=%llu expected=%llu current_file=%u current_file_written=%llu bit_count=%d pos=%zu bytes_in_buf=%zu\n",
-                    (unsigned long long)total_output,
-                    (unsigned long long)expected_total,
-                    current_file,
-                    (unsigned long long)current_file_written,
-                    bs.bit_count, bs.pos, bs.bytes_in_buf);
 
     uint32_t file_crc;
     if (!bs_read_aligned_uint32(&bs, &file_crc)) {
