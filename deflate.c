@@ -458,6 +458,7 @@ typedef struct {
 #define SAFE_FREE(ptr) do { if (ptr) { free(ptr); ptr = NULL; } } while(0)
 
 /* Forward declarations removed: free_tree and heap_destroy eliminated by arena allocator */
+static bool is_valid_host_path(const char *path);
 
 /* ==================== SECURE FILE I/O ==================== */
 
@@ -2139,6 +2140,13 @@ static bool verify_pkcs1_v15_sha256_em(const uint8_t *em, size_t em_len,
 static DeflateError verify_archive_signature(const char *archive_path,
                                              const char *sig_path,
                                              const char *pubkey_path) {
+    if (!is_valid_host_path(archive_path) ||
+        !is_valid_host_path(sig_path) ||
+        !is_valid_host_path(pubkey_path)) {
+        LOG_ERR("Error: Invalid path\n");
+        return DEFLATE_ERR_PATH;
+    }
+
     RsaPublicKey key;
     memset(&key, 0, sizeof(key));
     if (!load_rsa_public_key(pubkey_path, &key)) {
@@ -2916,14 +2924,31 @@ static bool validate_canonical_entries(const CanonicalEntry *table, int32_t t_co
 /* ==================== PATH SECURITY ==================== */
 
 /**
- * FIX #8: Allows "./" prefix (current directory) but rejects "..".
- * FIX #12: Use 'check' consistently after skipping "./" prefix.
+ * Host-side path policy for caller-supplied filesystem arguments.
+ * Rejects control characters, absolute paths, Windows drive paths, and
+ * parent-directory components while allowing relative paths rooted at ".".
  */
 static bool is_valid_host_path(const char *path) {
     if (!path || !path[0]) return false;
 
-    for (const unsigned char *p = (const unsigned char *)path; *p; p++) {
-        if (*p < 32) return false;
+    /* Reject absolute paths. */
+    if (path[0] == '/' || path[0] == '\\') return false;
+    if (strlen(path) >= 2 && path[1] == ':') return false;  /* Windows drive */
+
+    const char *p = path;
+    while (*p) {
+        const char *end = p;
+        while (*end && *end != '/' && *end != '\\') end++;
+        size_t comp_len = (size_t)(end - p);
+
+        if (comp_len == 2 && p[0] == '.' && p[1] == '.') return false;
+
+        for (const unsigned char *c = (const unsigned char *)p;
+             c < (const unsigned char *)end; c++) {
+            if (*c < 32) return false;
+        }
+
+        p = *end ? end + 1 : end;
     }
 
     return true;
@@ -3108,7 +3133,7 @@ static DeflateError compress_file(const char *infile, const char *outfile) {
     DeflateError result = DEFLATE_OK;
 
     if (!is_valid_host_path(infile) || !is_valid_host_path(outfile)) {
-        LOG_ERR("Error: Invalid file path\n");
+        LOG_ERR("Error: Invalid path\n");
         return DEFLATE_ERR_PATH;
     }
 
@@ -3342,7 +3367,7 @@ static DeflateError compress_folder(const char *folder_path, const char *outfile
     uint64_t total_bytes_in = 0;
 
     if (!is_valid_host_path(folder_path) || !is_valid_host_path(outfile)) {
-        LOG_ERR("Error: Invalid output path\n");
+        LOG_ERR("Error: Invalid path\n");
         return DEFLATE_ERR_PATH;
     }
 
@@ -3612,7 +3637,7 @@ static DeflateError decompress_file(const char *infile, const char *outfile) {
     bool output_committed = false;
 
     if (!is_valid_host_path(infile) || !is_valid_host_path(outfile)) {
-        LOG_ERR("Error: Invalid file path\n");
+        LOG_ERR("Error: Invalid path\n");
         return DEFLATE_ERR_PATH;
     }
 

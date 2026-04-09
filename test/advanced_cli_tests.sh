@@ -3,7 +3,7 @@
 # MiniDeflate v6.0 — Advanced Integration Test Suite
 #
 # Builds deflate.c in a disposable temp directory and exercises the binary
-# through 43 test cases covering:
+# through 46 test cases covering:
 #
 #   Category A  — CLI argument parsing and flags
 #   Category B  — Data integrity round-trips (edge-case payloads)
@@ -622,26 +622,26 @@ test_B10_folder_all_empty_files() {
     assert_file_size "$WORK_DIR/all-empty-out/sub/c.bin" 0
 }
 
-test_B11_absolute_file_paths_roundtrip() {
-    printf 'absolute-path-roundtrip\n' > "$WORK_DIR/abs.txt"
+test_B11_explicit_current_directory_file_roundtrip() {
+    printf 'current-directory-roundtrip\n' > "$WORK_DIR/cwd.txt"
 
-    run_raw abs_c "$BIN" -c "$WORK_DIR/abs.txt" "$WORK_DIR/abs.proz"
+    run_in_workdir cwd_c "$BIN" -c ./cwd.txt ./cwd.proz
     assert_exit_ok
-    run_raw abs_d "$BIN" -d "$WORK_DIR/abs.proz" "$WORK_DIR/abs.out"
+    run_in_workdir cwd_d "$BIN" -d ./cwd.proz ./cwd.out
     assert_exit_ok
 
-    assert_file_eq "$WORK_DIR/abs.txt" "$WORK_DIR/abs.out"
+    assert_file_eq "$WORK_DIR/cwd.txt" "$WORK_DIR/cwd.out"
 }
 
-test_B12_absolute_folder_paths_roundtrip() {
-    gen_folder_fixture "$WORK_DIR/abs-folder-src"
+test_B12_explicit_current_directory_folder_roundtrip() {
+    gen_folder_fixture "$WORK_DIR/cwd-folder-src"
 
-    run_raw absfolder_c "$BIN" -c "$WORK_DIR/abs-folder-src" "$WORK_DIR/abs-folder.proz"
+    run_in_workdir cwdfolder_c "$BIN" -c ./cwd-folder-src ./cwd-folder.proz
     assert_exit_ok
-    run_raw absfolder_d "$BIN" -d "$WORK_DIR/abs-folder.proz" "$WORK_DIR/abs-folder-out"
+    run_in_workdir cwdfolder_d "$BIN" -d ./cwd-folder.proz ./cwd-folder-out
     assert_exit_ok
 
-    assert_dir_eq "$WORK_DIR/abs-folder-src" "$WORK_DIR/abs-folder-out"
+    assert_dir_eq "$WORK_DIR/cwd-folder-src" "$WORK_DIR/cwd-folder-out"
 }
 
 test_B05_folder_roundtrip_nested_paths() {
@@ -1045,6 +1045,70 @@ test_D09_signature_wrong_key_rejected() {
     assert_stderr_contains "Signature verification failed"
 }
 
+test_D10_absolute_host_paths_rejected() {
+    printf 'absolute-host-path\n' > "$WORK_DIR/abs-src.txt"
+
+    run_raw abs_host_c "$BIN" -c "$WORK_DIR/abs-src.txt" "$WORK_DIR/abs-host.proz"
+    assert_exit_fail
+    assert_exit_code 6
+    assert_stderr_contains "Error: Invalid path"
+    assert_not_exists "$WORK_DIR/abs-host.proz"
+
+    printf 'seed\n' > "$WORK_DIR/abs-seed.txt"
+    run_in_workdir abs_seed_c "$BIN" -c ./abs-seed.txt ./abs-seed.proz
+    assert_exit_ok
+
+    run_raw abs_host_d "$BIN" -d "$WORK_DIR/abs-seed.proz" "$WORK_DIR/abs-host-out"
+    assert_exit_fail
+    assert_exit_code 6
+    assert_stderr_contains "Error: Invalid path"
+    assert_not_exists "$WORK_DIR/abs-host-out"
+}
+
+test_D11_parent_directory_host_paths_rejected() {
+    local self_ref="../$(basename "$WORK_DIR")/parent-src.txt"
+    local escape_out="$WORK_DIR/../minideflate-hostpath-rel"
+
+    printf 'parent-host-path\n' > "$WORK_DIR/parent-src.txt"
+    rm -rf "$escape_out"
+
+    run_in_workdir parent_host_c "$BIN" -c "$self_ref" ./parent-host.proz
+    assert_exit_fail
+    assert_exit_code 6
+    assert_stderr_contains "Error: Invalid path"
+    assert_not_exists "$WORK_DIR/parent-host.proz"
+
+    printf 'seed\n' > "$WORK_DIR/parent-seed.txt"
+    run_in_workdir parent_seed_c "$BIN" -c ./parent-seed.txt ./parent-seed.proz
+    assert_exit_ok
+
+    run_in_workdir parent_host_d "$BIN" -d ./parent-seed.proz ../minideflate-hostpath-rel
+    assert_exit_fail
+    assert_exit_code 6
+    assert_stderr_contains "Error: Invalid path"
+    assert_not_exists "$escape_out"
+}
+
+test_D12_verify_mode_host_paths_rejected() {
+    printf 'verify-path-policy\n' > "$WORK_DIR/verify-src.txt"
+    run_in_workdir verifypath_c "$BIN" -c ./verify-src.txt ./verify-path.proz
+    assert_exit_ok
+
+    generate_rsa_signature_fixture \
+        "$WORK_DIR/verify-path.proz" \
+        "$WORK_DIR/public.pem" \
+        "$WORK_DIR/verify-path.sig" \
+        "$WORK_DIR/wrong-public.pem"
+
+    run_raw verifypath_v "$BIN" --verify \
+        --sig "$WORK_DIR/verify-path.sig" \
+        --pubkey "$WORK_DIR/public.pem" \
+        "$WORK_DIR/verify-path.proz"
+    assert_exit_fail
+    assert_exit_code 6
+    assert_stderr_contains "Error: Invalid path"
+}
+
 # ========================= CATEGORY E: OUTPUT MODES ========================
 
 test_E01_verbose_shows_details() {
@@ -1131,8 +1195,8 @@ main() {
     run_test test_B08_folder_with_empty_files
     run_test test_B09_large_multiblock
     run_test test_B10_folder_all_empty_files
-    run_test test_B11_absolute_file_paths_roundtrip
-    run_test test_B12_absolute_folder_paths_roundtrip
+    run_test test_B11_explicit_current_directory_file_roundtrip
+    run_test test_B12_explicit_current_directory_folder_roundtrip
 
     # --- Category C: Format validation ---
     printf '\n%s\n' '--- Category C: Archive Format Validation ---'
@@ -1160,6 +1224,9 @@ main() {
     run_test test_D07_existing_output_directory_conflict_rejected
     run_test test_D08_signed_decompress_tampered_archive_rejected
     run_test test_D09_signature_wrong_key_rejected
+    run_test test_D10_absolute_host_paths_rejected
+    run_test test_D11_parent_directory_host_paths_rejected
+    run_test test_D12_verify_mode_host_paths_rejected
 
     # --- Category E: Output modes ---
     printf '\n%s\n' '--- Category E: Output Mode Behaviour ---'
