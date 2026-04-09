@@ -1,6 +1,6 @@
 # MiniDeflate Test Suite
 
-Integration tests for MiniDeflate v5.0. The suite builds `deflate.c` from
+Integration tests for MiniDeflate v6.0. The suite builds `deflate.c` from
 source in an isolated temp directory and exercises the resulting binary through
 **43 test cases** organised into five categories.
 
